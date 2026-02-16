@@ -9,6 +9,7 @@ import pandas as pd
 
 class GraphMetrics:
     """Handles graph-level metric calculations"""
+    COMMUNITY_BOUNDARY_THRESHOLD = 0.2
     
     def __init__(self, target_names=None):
         self.target_names = target_names
@@ -57,35 +58,125 @@ class GraphMetrics:
         )
         return dict(results)
 
+    @staticmethod
+    def _parse_predicate(label: str):
+        """
+        Parse labels like "feature <= 1.23" or "feature > 0.7".
+        Returns (feature, operator, threshold) or None.
+        """
+        match = re.match(
+            r"^\s*(.+?)\s*(<=|>)\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$",
+            str(label),
+        )
+        if not match:
+            return None
+        feature, operator, threshold = match.groups()
+        return feature.strip(), operator, float(threshold)
+
+    @staticmethod
+    def _normalize_class_label(label: str) -> str:
+        text = str(label)
+        if text.startswith("Class "):
+            return text.replace("Class ", "", 1)
+        return text
+
     @classmethod
     def extract_class_boundaries(cls, dpg_model: nx.DiGraph, nodes_list: List[tuple], target_names: List[str]) -> Dict:
-        """Main interface for graph metrics"""
+        """
+        Extract class boundaries from community assignments (cluster-based),
+        not from the legacy LPA graph-metrics path.
+        """
         # Create node mappings
         node_label_to_id = {node[1]: node[0] for node in nodes_list if "->" not in node[0]}
         node_id_to_label = {v: k for k, v in node_label_to_id.items()}
-        
-        # Class boundaries
-        terminal_nodes = {
-            k: v for k, v in node_label_to_id.items() 
-            if any(x in k for x in ['Class', 'Pred'])
+
+        # Class nodes as absorbing states for community assignment.
+        class_nodes = {
+            node_id: label
+            for label, node_id in node_label_to_id.items()
+            if str(label).startswith("Class ")
         }
-        predecessors = {}
-        
-        for class_name, node_id in terminal_nodes.items():
-            try:
-                preds = nx.descendants(dpg_model.reverse(), node_id)
-                predecessors[class_name] = [
-                    node_id_to_label[p] for p in preds 
-                    if p in node_id_to_label and not any(
-                        x in node_id_to_label[p] for x in ['Class', 'Pred']
-                    )
-                ]
-            except nx.NetworkXError:
-                predecessors[class_name] = []
-        
-        # Calculate boundaries
-        class_bounds = cls.calculate_boundaries(predecessors, target_names)
-        
+
+        if not class_nodes:
+            return {"Class Bounds": {}}
+
+        clusters, _, _ = cls.clustering(
+            dpg_model,
+            class_nodes,
+            threshold=cls.COMMUNITY_BOUNDARY_THRESHOLD,
+        )
+
+        # Per-class, per-feature threshold buckets (community-derived).
+        bucket = defaultdict(lambda: defaultdict(lambda: {"gt": [], "le": [], "all": []}))
+
+        for class_label, members in clusters.items():
+            class_from_cluster = None
+            if str(class_label).lower() != "ambiguous":
+                class_from_cluster = cls._normalize_class_label(class_label)
+
+            for node in members:
+                label = node_id_to_label.get(node, node_id_to_label.get(str(node)))
+                if label is None:
+                    continue
+                parsed = cls._parse_predicate(label)
+                if parsed is None:
+                    continue
+                feature, operator, threshold = parsed
+
+                if class_from_cluster is not None:
+                    target_classes = [class_from_cluster]
+                else:
+                    descendants = nx.descendants(dpg_model, node)
+                    target_classes = [
+                        cls._normalize_class_label(class_nodes[class_node])
+                        for class_node in class_nodes
+                        if class_node in descendants
+                    ]
+
+                for target_class in target_classes:
+                    bucket[target_class][feature]["all"].append(threshold)
+                    if operator == ">":
+                        bucket[target_class][feature]["gt"].append(threshold)
+                    elif operator == "<=":
+                        bucket[target_class][feature]["le"].append(threshold)
+
+        class_bounds = {}
+        for class_name, feature_map in bucket.items():
+            boundaries = []
+            for feature, values in feature_map.items():
+                lower = min(values["gt"]) if values["gt"] else float("-inf")
+                upper = max(values["le"]) if values["le"] else float("inf")
+                if lower > upper:
+                    lower = min(values["all"]) if values["all"] else float("-inf")
+                    upper = max(values["all"]) if values["all"] else float("inf")
+
+                if np.isfinite(lower) and np.isfinite(upper):
+                    boundaries.append(f"{lower} < {feature} <= {upper}")
+                elif np.isfinite(upper):
+                    boundaries.append(f"{feature} <= {upper}")
+                elif np.isfinite(lower):
+                    boundaries.append(f"{feature} > {lower}")
+
+            if boundaries:
+                key = str(class_name)
+                if not key.startswith("Class "):
+                    key = f"Class {key}"
+                class_bounds[key] = boundaries
+
+        # Keep stable ordering when target_names are provided.
+        if target_names:
+            ordered = {}
+            for target_name in target_names:
+                key = str(target_name)
+                if not key.startswith("Class "):
+                    key = f"Class {key}"
+                if key in class_bounds:
+                    ordered[key] = class_bounds[key]
+            for key in sorted(class_bounds.keys()):
+                if key not in ordered:
+                    ordered[key] = class_bounds[key]
+            class_bounds = ordered
+
         return {
             "Class Bounds": class_bounds
         }

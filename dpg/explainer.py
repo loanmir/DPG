@@ -7,7 +7,15 @@ import numpy as np
 import pandas as pd
 
 from .core import DecisionPredicateGraph
-from .visualizer import plot_dpg, plot_dpg_communities
+from .visualizer import (
+    class_feature_predicate_counts,
+    class_lookup_from_target_names,
+    plot_dpg,
+    plot_dpg_class_bounds_vs_dataset_feature_ranges,
+    plot_dpg_communities,
+    plot_lrc_vs_rf_importance,
+    plot_top_lrc_predicate_splits,
+)
 from metrics.graph import GraphMetrics
 from metrics.nodes import NodeMetrics
 from metrics.edges import EdgeMetrics
@@ -203,4 +211,97 @@ class DPGExplainer:
             pdf_dpi=pdf_dpi,
             show=show,
             export_pdf=export_pdf,
+        )
+
+    def plot_lrc_importance(
+        self,
+        X_df: pd.DataFrame,
+        explanation: Optional[DPGExplanation] = None,
+        top_k: int = 10,
+        dataset_name: str = "Dataset",
+        save_path: Optional[str] = None,
+        show: bool = True,
+    ) -> Any:
+        """Plot top LRC predicates vs RF feature importances."""
+        if explanation is None:
+            explanation = self.explain_global()
+        return plot_lrc_vs_rf_importance(
+            explanation=explanation,
+            model=self._builder.model,
+            X_df=X_df,
+            top_k=top_k,
+            dataset_name=dataset_name,
+            save_path=save_path,
+            show=show,
+        )
+
+    def plot_top_lrc_splits(
+        self,
+        X_df: pd.DataFrame,
+        y,
+        explanation: Optional[DPGExplanation] = None,
+        top_predicates: int = 5,
+        top_features: int = 2,
+        dataset_name: str = "Dataset",
+        save_path: Optional[str] = None,
+        show: bool = True,
+    ) -> Optional[Any]:
+        """Plot top-LRC split lines over the top-2 LRC feature space."""
+        if explanation is None:
+            explanation = self.explain_global()
+        return plot_top_lrc_predicate_splits(
+            explanation=explanation,
+            X_df=X_df,
+            y=y,
+            top_predicates=top_predicates,
+            top_features=top_features,
+            dataset_name=dataset_name,
+            save_path=save_path,
+            show=show,
+        )
+
+    def class_feature_predicate_counts(
+        self,
+        explanation: Optional[DPGExplanation] = None,
+        community_threshold: float = 0.2,
+    ) -> pd.DataFrame:
+        """Return class-vs-feature predicate count matrix from communities."""
+        if explanation is None or explanation.communities is None:
+            explanation = self.explain_global(communities=True, community_threshold=community_threshold)
+        return class_feature_predicate_counts(explanation)
+
+    def plot_class_bounds_vs_dataset_ranges(
+        self,
+        X_df: pd.DataFrame,
+        y,
+        explanation: Optional[DPGExplanation] = None,
+        dataset_name: str = "Dataset",
+        top_features: int = 4,
+        class_lookup: Optional[Dict[str, int]] = None,
+        class_filter: Optional[List[str]] = None,
+        density_tol_ratio: float = 0.03,
+        predicate_alpha: float = 0.55,
+        dataset_range_lw: float = 10,
+        save_path: Optional[str] = None,
+        show: bool = True,
+        community_threshold: float = 0.2,
+    ) -> Optional[Any]:
+        """Plot DPG class bounds against empirical dataset feature ranges."""
+        if explanation is None or explanation.communities is None:
+            explanation = self.explain_global(communities=True, community_threshold=community_threshold)
+        if class_lookup is None:
+            class_lookup = class_lookup_from_target_names(self._builder.target_names)
+        return plot_dpg_class_bounds_vs_dataset_feature_ranges(
+            explanation=explanation,
+            X_df=X_df,
+            y=y,
+            dataset_name=dataset_name,
+            top_features=top_features,
+            class_lookup=class_lookup,
+            class_filter=class_filter,
+            density_tol_ratio=density_tol_ratio,
+            predicate_alpha=predicate_alpha,
+            dataset_range_lw=dataset_range_lw,
+            save_path=save_path,
+            show=show,
         )
