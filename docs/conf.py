@@ -33,6 +33,8 @@ extensions = [
     "myst_parser",
     # Copy-button on all code blocks.
     "sphinx_copybutton",
+    # Grid cards, tabs, badges — required for ::::{grid} in index.md.
+    "sphinx_design",
 ]
 
 # Let MyST parse both .md and .rst files.
@@ -54,9 +56,10 @@ autoapi_options = [
     "undoc-members",
     "show-inheritance",
     "show-module-summary",
-    "special-members",
-    "imported-members",
 ]
+# Don't re-document members imported from other modules (avoids duplicates
+# when e.g. DecisionPredicateGraph is in both dpg.core and dpg.__init__).
+autoapi_keep_files = False
 # Put the auto-generated pages under /api/
 autoapi_root = "api"
 # Don't add autoapi to the TOC automatically — we control placement in index.

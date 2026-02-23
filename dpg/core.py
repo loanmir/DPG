@@ -43,14 +43,11 @@ class DPGError(Exception):
 class DecisionPredicateGraph:
     """
     Main class for converting tree-based ensemble models into interpretable graphs.
-    
-    Attributes:
-        model: Trained tree ensemble model (RandomForest, AdaBoost, etc.)
-        feature_names: List of feature names
-        target_names: List of target class names
-        perc_var: Minimum path frequency threshold (0-1)
-        decimal_threshold: Rounding precision for feature values
-        n_jobs: Number of parallel jobs (-1 for all cores)
+
+    Converts the internal decision paths of a tree-based ensemble (Random Forest,
+    AdaBoost, Extra Trees, …) into a compact directed graph — the
+    *Decision Predicate Graph* — that exposes which feature conditions the model
+    uses, how often, and in what order.
     """
     def __init__(
         self,

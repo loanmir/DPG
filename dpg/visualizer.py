@@ -128,27 +128,34 @@ def plot_dpg(
     Plot a Decision Predicate Graph (DPG) with optional node/edge styling.
 
     Args:
-    plot_name: Output base name for saved files (no extension).
-    dot: Graphviz Digraph instance representing the DPG structure.
-    df: DataFrame with node metrics; must include 'Node' and 'Label' columns.
-    df_edges: DataFrame with edge metrics; must include 'Source_id', 'Target_id', and 'Weight'.
-    save_dir: Directory where output images are saved. Default is "results/".
-    attribute: Optional node metric column name to color nodes by (e.g., 'Degree').
-    clusters: Optional mapping {cluster_label: [node_id, ...]} to color nodes by clusters.
-    threshold_clusters: Optional value used only to annotate the output name.
-    class_flag: If True, class nodes are highlighted in yellow before other coloring.
-    layout_template: Optional layout preset. One of {'default','compact','vertical','wide'}.
-    graph_style: Optional dict of Graphviz graph attributes to override template values.
-    node_style: Optional dict of Graphviz node attributes to override template values.
-    edge_style: Optional dict of Graphviz edge attributes to override template values.
-    fig_size: Matplotlib figure size (width, height).
-    dpi: PNG export/display resolution.
-    pdf_dpi: PDF export resolution when export_pdf=True.
-    show: Whether to display the image via matplotlib. Default is True.
-    export_pdf: If True, also writes a PDF next to the PNG.
+        plot_name: Output base name for saved files (no extension).
+        dot: Graphviz Digraph instance representing the DPG structure.
+        df: DataFrame with node metrics; must include ``'Node'`` and ``'Label'`` columns.
+        df_edges: DataFrame with edge metrics; must include ``'Source_id'``,
+            ``'Target_id'``, and ``'Weight'``.
+        save_dir: Directory where output images are saved. Default is ``"results/"``.
+        attribute: Optional node metric column name to color nodes by (e.g. ``'Degree'``).
+        clusters: Optional mapping ``{cluster_label: [node_id, ...]}`` to color nodes
+            by cluster membership.
+        threshold_clusters: Optional value used only to annotate the output filename.
+        class_flag: If ``True``, class nodes are highlighted in yellow before other
+            coloring.
+        layout_template: Optional layout preset. One of
+            ``{'default', 'compact', 'vertical', 'wide'}``.
+        graph_style: Optional dict of Graphviz graph attributes to override template
+            values.
+        node_style: Optional dict of Graphviz node attributes to override template
+            values.
+        edge_style: Optional dict of Graphviz edge attributes to override template
+            values.
+        fig_size: Matplotlib figure size as ``(width, height)``.
+        dpi: PNG export/display resolution.
+        pdf_dpi: PDF export resolution when ``export_pdf=True``.
+        show: Whether to display the image via Matplotlib. Default is ``True``.
+        export_pdf: If ``True``, also writes a PDF next to the PNG.
 
     Returns:
-    None
+        None
     """
     print("Plotting DPG...")
     _apply_layout_template(
@@ -341,26 +348,33 @@ def plot_dpg_communities(
     Plot a DPG colored by community assignment.
 
     Args:
-    plot_name: Output base name for saved files (no extension).
-    dot: Graphviz Digraph instance representing the DPG structure.
-    df: DataFrame with node metrics; must include 'Node' and 'Label' columns.
-    dpg_metrics: Dict containing either 'Communities' (list of sets/lists of node labels)
-                 or 'Clusters' (mapping cluster_label -> list of node labels).
-    save_dir: Directory where output images are saved. Default is "results/".
-    class_flag: If True, class nodes are highlighted in yellow before other coloring.
-    df_edges: Optional DataFrame with edge metrics to color edges by weight.
-    layout_template: Optional layout preset. One of {'default','compact','vertical','wide'}.
-    graph_style: Optional dict of Graphviz graph attributes to override template values.
-    node_style: Optional dict of Graphviz node attributes to override template values.
-    edge_style: Optional dict of Graphviz edge attributes to override template values.
-    fig_size: Matplotlib figure size (width, height).
-    dpi: PNG export/display resolution.
-    pdf_dpi: PDF export resolution when export_pdf=True.
-    show: Whether to display the image via matplotlib. Default is True.
-    export_pdf: If True, also writes a PDF next to the PNG.
+        plot_name: Output base name for saved files (no extension).
+        dot: Graphviz Digraph instance representing the DPG structure.
+        df: DataFrame with node metrics; must include ``'Node'`` and ``'Label'``
+            columns.
+        dpg_metrics: Dict containing either ``'Communities'`` (list of sets/lists of
+            node labels) or ``'Clusters'`` (mapping cluster_label -> list of node
+            labels).
+        save_dir: Directory where output images are saved. Default is ``"results/"``.
+        class_flag: If ``True``, class nodes are highlighted in yellow before other
+            coloring.
+        df_edges: Optional DataFrame with edge metrics to color edges by weight.
+        layout_template: Optional layout preset. One of
+            ``{'default', 'compact', 'vertical', 'wide'}``.
+        graph_style: Optional dict of Graphviz graph attributes to override template
+            values.
+        node_style: Optional dict of Graphviz node attributes to override template
+            values.
+        edge_style: Optional dict of Graphviz edge attributes to override template
+            values.
+        fig_size: Matplotlib figure size as ``(width, height)``.
+        dpi: PNG export/display resolution.
+        pdf_dpi: PDF export resolution when ``export_pdf=True``.
+        show: Whether to display the image via Matplotlib. Default is ``True``.
+        export_pdf: If ``True``, also writes a PDF next to the PNG.
 
     Returns:
-    None
+        None
     """
     print("Plotting DPG (communities)...")
     _apply_layout_template(
