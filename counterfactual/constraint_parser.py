@@ -12,12 +12,7 @@ try:
 except ImportError:
     HAS_OMEGACONF = False
 
-# Add DPG to path for imports
-_dpg_path = os.path.join(os.path.dirname(__file__), 'DPG')
-if _dpg_path not in sys.path:
-    sys.path.insert(0, _dpg_path)
-
-from dpg.core import DecisionPredicateGraph
+from dpg import DecisionPredicateGraph
 from metrics.graph import GraphMetrics
 
 class ConstraintParser:

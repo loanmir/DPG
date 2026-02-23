@@ -16,9 +16,11 @@ import os
 import pathlib
 import sys
 
-# Ensure repo root is on sys.path
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# Ensure repo root is on sys.path (DPG root, not counterfactual)
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+COUNTERFACTUAL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(COUNTERFACTUAL_ROOT))
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -28,8 +30,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 # Import DPG visualization
 try:
-    sys.path.insert(0, str(REPO_ROOT / 'DPG'))
-    from DPG.dpg import plot_dpg_constraints_overview
+    from dpg import plot_dpg_constraints_overview
 
     DPG_PKG_AVAILABLE = True
 except ImportError:
