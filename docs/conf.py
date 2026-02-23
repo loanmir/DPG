@@ -55,7 +55,7 @@ suppress_warnings = ["autoapi"]
 # ---------------------------------------------------------------------------
 # sphinx-autoapi
 # ---------------------------------------------------------------------------
-autoapi_dirs = ["../dpg", "../metrics"]
+autoapi_dirs = ["../dpg", "../metrics", "../counterfactual"]
 autoapi_type = "python"
 autoapi_options = [
     "members",
@@ -68,7 +68,17 @@ autoapi_options = [
 # introspect those Cython types and emits "Unknown type: placeholder".
 # Excluding the file from autoapi avoids this and is correct — the module is
 # not part of the public API that we want documented via autoapi.
-autoapi_ignore = ["*sklearn_dpg*"]
+autoapi_ignore = [
+    "*sklearn_dpg*",
+    # Counterfactual sub-packages that are internal (scripts, utilities, etc.)
+    "*/counterfactual/scripts/*",
+    "*/counterfactual/utils/*",
+    "*/counterfactual/notebooks/*",
+    "*/counterfactual/wandb/*",
+    "*/counterfactual/outputs/*",
+    # Virtual environment embedded inside counterfactual/
+    "*/counterfactual/.venv/*",
+]
 # Don't re-document members imported from other modules (avoids duplicates
 # when e.g. DecisionPredicateGraph is in both dpg.core and dpg.__init__).
 autoapi_keep_files = False

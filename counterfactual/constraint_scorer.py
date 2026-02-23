@@ -179,13 +179,16 @@ def compute_constraint_score(
     
     Args:
         constraints: Dictionary mapping class labels to feature constraints.
-            Format: {
-                "Class 0": {
-                    "feature1": {"min": value, "max": value},
+            Expected format::
+
+                {
+                    "Class 0": {
+                        "feature1": {"min": value, "max": value},
+                        ...
+                    },
                     ...
-                },
-                ...
-            }
+                }
+
         n_total_features: Total number of features in the dataset. If None,
             inferred as max features observed across all classes in constraints.
         n_total_classes: Total number of classes in the dataset. If None,
