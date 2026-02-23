@@ -17,9 +17,11 @@ from __future__ import annotations
 import pathlib
 import sys
 
-# Ensure repo root is on sys.path
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# Ensure repo root is on sys.path (DPG root, not counterfactual)
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
+COUNTERFACTUAL_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(COUNTERFACTUAL_ROOT))
 
 import argparse
 import json
@@ -47,8 +49,7 @@ from constraint_scorer import compute_constraint_score
 
 # Import DPG visualization if available
 try:
-    sys.path.insert(0, str(REPO_ROOT / 'DPG'))
-    from DPG.dpg import plot_dpg_constraints_overview
+    from dpg import plot_dpg_constraints_overview
     import matplotlib.pyplot as plt
     DPG_PKG_AVAILABLE = True
 except ImportError:

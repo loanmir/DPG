@@ -46,3 +46,8 @@ htmlcov/
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
+
+
+outputs/
+
+wandb/
