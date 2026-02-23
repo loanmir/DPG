@@ -116,6 +116,10 @@ def load_config(config_path: str, method: str = None, repo_root: str = None) -> 
         # dirname thrice: repo root
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(abs_config_path)))
     
+    # Resolve config_path relative to repo_root if it's not absolute
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(repo_root, config_path)
+    
     # Load base defaults from configs/config.yaml if it exists
     base_config_path = os.path.join(repo_root, 'configs', 'config.yaml')
     base_config = {}

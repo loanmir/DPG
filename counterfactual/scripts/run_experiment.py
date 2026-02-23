@@ -1973,11 +1973,11 @@ def main():
                 else None
             )
 
-            if os.path.exists(os.path.join(REPO_ROOT, unified_config_path)):
+            if os.path.exists(os.path.join(COUNTERFACTUAL_ROOT, unified_config_path)):
                 args.config = unified_config_path
                 print(f"INFO: Using unified config: {args.config}")
             elif legacy_config_path and os.path.exists(
-                os.path.join(REPO_ROOT, legacy_config_path)
+                os.path.join(COUNTERFACTUAL_ROOT, legacy_config_path)
             ):
                 args.config = legacy_config_path
                 print(f"INFO: Using legacy config path: {args.config}")
@@ -1996,7 +1996,7 @@ def main():
 
     # Load config with method selection
     print(f"INFO: Loading config from {args.config}")
-    config = load_config(args.config, method=args.method, repo_root=str(REPO_ROOT))
+    config = load_config(args.config, method=args.method, repo_root=str(COUNTERFACTUAL_ROOT))
 
     # Apply overrides
     if args.overrides:
@@ -2018,7 +2018,7 @@ def main():
         else "outputs"
     )
     if not output_dir.is_absolute():
-        output_dir = REPO_ROOT / output_dir
+        output_dir = COUNTERFACTUAL_ROOT / output_dir
 
     # Determine dataset and method for status tracking
     dataset_name = args.dataset or getattr(config.data, "dataset", "unknown")
