@@ -154,6 +154,7 @@ html_context = {
     "doc_path": "docs",
 }
 
+html_logo = "_static/DPG.png"
 html_title = "DPG"
 html_short_title = "DPG"
 html_css_files = ["custom.css"]
