@@ -6,7 +6,12 @@ This script demonstrates a complete workflow for:
 2. Generating Decision Predicate Graphs (DPG)
 3. Extracting and visualizing interpretability metrics
 """
+import sys
 import os
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
+
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -80,7 +85,7 @@ def main():
         "num_trees": 10,
         "run_tag": "CustomDPG",
         "random_state": 27,
-        "config_path": "config.yaml",
+        "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
         "results_dir": "results/",
     }
 
@@ -88,7 +93,7 @@ def main():
     config_data = load_config(config["config_path"])
     perc_var = config_data["dpg"]["default"]["perc_var"]
 
-    base_dir = os.getcwd()
+    base_dir = PROJECT_ROOT
     # Load and clean the dataset
     features_matrix, labels, feature_names = load_dataset(
         config["dataset_name"], base_dir
