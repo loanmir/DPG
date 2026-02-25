@@ -14,10 +14,10 @@ DPG provides descriptive metrics that enhance the understanding of the decisions
 Install DPG and run your first explanation in minutes.
 :::
 :::{grid-item-card} API Reference
-:link: api/dpg/index
+:link: api_reference
 :link-type: doc
 
-Full API documentation generated from source docstrings.
+Full API documentation for dpg, metrics, and counterfactual.
 :::
 :::{grid-item-card} Counterfactual
 :link: api/counterfactual/index
@@ -59,7 +59,5 @@ quickstart
 :maxdepth: 1
 :caption: API Reference
 
-api/dpg/index
-api/metrics/index
-api/counterfactual/index
+api_reference
 ```

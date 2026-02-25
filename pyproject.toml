@@ -10,7 +10,8 @@ repository = "https://github.com/Meta-Group/DPG"
 keywords = ["decision graph", "ensemble learning", "explainable ai", "explainability", "global explanations"]
 packages = [
     { include = "dpg" },
-    { include = "metrics" }
+    { include = "metrics" },
+    { include = "counterfactual" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

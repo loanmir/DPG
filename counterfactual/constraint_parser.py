@@ -16,6 +16,13 @@ from dpg import DecisionPredicateGraph
 from metrics.graph import GraphMetrics
 
 class ConstraintParser:
+    """Parse, normalise, and extract feature constraints from DPG models.
+
+    Reads constraint files or extracts constraints directly from a
+    :class:`~dpg.DecisionPredicateGraph`, returning structured
+    dictionaries suitable for counterfactual generation and scoring.
+    """
+
     def __init__(self, filename=None):
         self.filename = filename
         self.constraints_dict = {}
