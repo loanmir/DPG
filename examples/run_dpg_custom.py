@@ -1,7 +1,8 @@
 import sys
 import os
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 import yaml
@@ -16,9 +17,9 @@ if __name__ == "__main__":
     parser.add_argument("--target_column", type=str, help="Name of the column to be used as the target variable")
     parser.add_argument("--n_learners", type=int, default=5, help="Number of learners for the Ensemble model")
     parser.add_argument("--model_name", type=str, default="RandomForestClassifier", help="Chosen tree-based ensemble model")
-    parser.add_argument("--dir", type=str, default=os.path.join(PROJECT_ROOT, "examples"), help="Directory to save results")
+    parser.add_argument("--dir", type=str, default=os.path.join(SCRIPT_DIR, "results"), help="Directory to save results")
     parser.add_argument("--plot", action='store_true', help="Plot the DPG, add the argument to use it as True")
-    parser.add_argument("--save_plot_dir", type=str, default=os.path.join(PROJECT_ROOT, "examples"), help="Directory to save the plot image")
+    parser.add_argument("--save_plot_dir", type=str, default=os.path.join(SCRIPT_DIR, "results"), help="Directory to save the plot image")
     parser.add_argument("--attribute", type=str, default=None, help="A specific node attribute to visualize")
     parser.add_argument("--communities", action='store_true', help="Boolean indicating whether to visualize communities, add the argument to use it as True")
     parser.add_argument("--class_flag", action='store_true', help="Boolean indicating whether to highlight class nodes, add the argument to use it as True")
@@ -37,6 +38,8 @@ if __name__ == "__main__":
     pv = config['dpg']['default']['perc_var']
     t = config['dpg']['default']['decimal_threshold']
     j = config['dpg']['default']['n_jobs']
+
+    os.makedirs(args.dir, exist_ok=True)
 
     df, df_dpg_metrics = test.test_dpg(datasets = args.dataset,
                                         target_column = args.target_column,

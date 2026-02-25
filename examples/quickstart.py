@@ -9,7 +9,8 @@ This script demonstrates a complete workflow for:
 import sys
 import os
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
@@ -86,7 +87,7 @@ def main():
         "run_tag": "CustomDPG",
         "random_state": 27,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": "results/",
+        "results_dir": os.path.join(SCRIPT_DIR, "results"),
     }
 
     # Load DPG defaults from config.yaml
@@ -130,8 +131,9 @@ def main():
     )
 
     # Save class boundary summary
+    os.makedirs(config["results_dir"], exist_ok=True)
     class_boundaries_path = os.path.join(
-        base_dir, f"{config['results_dir']}/{run_id}_dpg_class_boundaries.txt"
+        config["results_dir"], f"{run_id}_dpg_class_boundaries.txt"
     )
     with open(class_boundaries_path, "w") as f:
         for key, value in explanation.class_boundaries.items():
@@ -139,18 +141,18 @@ def main():
 
     # Save node and edge metrics
     node_metrics_path = os.path.join(
-        base_dir, f"{config['results_dir']}/{run_id}_node_metrics.csv"
+        config["results_dir"], f"{run_id}_node_metrics.csv"
     )
     explanation.node_metrics.to_csv(node_metrics_path, encoding="utf-8")
 
     edge_metrics_path = os.path.join(
-        base_dir, f"{config['results_dir']}/{run_id}_edge_metrics.csv"
+        config["results_dir"], f"{run_id}_edge_metrics.csv"
     )
     explanation.edge_metrics.to_csv(edge_metrics_path, encoding="utf-8")
 
     # Save communities
     communities_path = os.path.join(
-        base_dir, f"{config['results_dir']}/{run_id}_dpg_communities.txt"
+        config["results_dir"], f"{run_id}_dpg_communities.txt"
     )
     if explanation.communities is not None:
         from metrics.graph import GraphMetrics
