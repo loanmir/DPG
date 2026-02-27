@@ -2,7 +2,7 @@
 
 Episode 1 (Iris) established the baseline explanation workflow, and Episode 2 (Wine) stress-tested it under richer multiclass overlap.
 
-Episode 3 applies the same protocol to Breast Cancer Wisconsin: a binary but high-dimensional benchmark where threshold interactions are dense and medically meaningful.
+Episode 3 applies the same protocol to Breast Cancer Wisconsin: a binary benchmark with higher dimensionality than Iris and Wine, where threshold interactions are dense and medically meaningful.
 
 Pipeline:
 1. Train baseline Random Forest.
@@ -64,6 +64,23 @@ DPG adds:
 
 This is especially relevant in Breast Cancer, where multiple related shape/texture features co-determine class boundaries.
 
+Implementation detail used in this run:
+- `decimal_threshold=2` (from DPG config), so predicate thresholds are rounded to two decimals.
+- This makes rules easier to read in tables/plots and improves communication without changing the modeling pipeline.
+
+Example:
+
+```python
+explainer = DPGExplainer(
+    model=model,
+    feature_names=X.columns,
+    target_names=bc.target_names.tolist(),
+    dpg_config={
+        "dpg": {"default": {"perc_var": 1e-9, "decimal_threshold": 2, "n_jobs": 1}}
+    },
+)
+```
+
 ---
 
 ## 4. LRC vs RF importance (complementary views)
@@ -74,16 +91,16 @@ Top-10 LRC predicates:
 
 | Predicate | LRC |
 |---|---:|
-| `mean concave points <= 0.04892` | 0.363338 |
-| `mean concavity <= 0.1045` | 0.328992 |
-| `worst concave points <= 0.14655` | 0.314939 |
-| `mean concave points <= 0.05142` | 0.265294 |
-| `mean area <= 696.050018` | 0.258134 |
-| `worst area <= 884.75` | 0.249449 |
-| `worst perimeter <= 106.049999` | 0.240473 |
-| `perimeter error <= 4.1025` | 0.237174 |
-| `worst area <= 927.100006` | 0.233047 |
-| `worst perimeter <= 104.950001` | 0.199184 |
+| `worst perimeter <= 104.95` | 1.411381 |
+| `worst symmetry <= 0.36` | 1.198727 |
+| `perimeter error <= 4.12` | 0.937071 |
+| `worst area <= 884.75` | 0.858048 |
+| `mean concavity <= 0.1` | 0.731993 |
+| `worst radius <= 15.45` | 0.712965 |
+| `worst perimeter > 104.95` | 0.685177 |
+| `mean concave points <= 0.05` | 0.673035 |
+| `worst concave points <= 0.15` | 0.616178 |
+| `worst compactness <= 0.72` | 0.590121 |
 
 Top RF features:
 
@@ -104,6 +121,13 @@ Interpretation:
 - strong overlap between top RF features and high-LRC predicates indicates coherent statistical and structural relevance,
 - threshold-level details reveal the decision logic granularity hidden by feature-level summaries.
 
+Improved RF vs LRC comparison:
+- **8 of the top-10 RF features** also appear in the top-10 LRC predicates:
+  `mean concave points`, `worst perimeter`, `worst concave points`, `worst area`,
+  `mean concavity`, `worst radius`, `worst compactness`, `worst symmetry`.
+- RF tells us *which features matter most globally*; LRC tells us *which exact thresholds route decisions*.
+- LRC also exposes directional behavior not visible in RF ranking alone (for example, `worst perimeter` appears with both `<=` and `>` rules), indicating a central bifurcation boundary.
+
 ![Top LRC predicate splits](images/top_lrc_predicate_splits.png)
 
 ---
@@ -113,11 +137,11 @@ Interpretation:
 ![BC bottleneck PCA cloud](images/bc_bottleneck_pca_cloud.png)
 
 Top BC predicates:
-- `worst concavity <= 0.37875` (0.000668)
-- `worst radius <= 16.83` (0.000525)
-- `worst area > 796.649994` (0.000406)
-- `area error <= 91.555` (0.000358)
-- `worst smoothness <= 0.17545` (0.000318)
+- `fractal dimension error > 0.0` (0.011913)
+- `worst fractal dimension <= 0.08` (0.007774)
+- `mean area <= 567.65` (0.007572)
+- `mean concavity <= 0.05` (0.005225)
+- `worst concave points <= 0.11` (0.005073)
 
 BC highlights transition predicates that bridge dense model-routing zones where class assignment is less straightforward.
 
@@ -140,8 +164,8 @@ Community view condenses many tree paths into interpretable decision modules and
 ![Community class complexity bars](images/communities_class_feature_complexity_bars.png)
 
 Complexity summary (from notebook):
-- `benign`: `192` predicates across `30` features.
-- `malignant`: `162` predicates across `29` features.
+- `benign`: `159` predicates across `30` features.
+- `malignant`: `122` predicates across `26` features.
 
 What this adds:
 - both classes use broad feature coverage,
@@ -155,8 +179,8 @@ What this adds:
 ![DPG vs dataset feature ranges](images/dpg_vs_dataset_feature_ranges.png)
 
 Boundary summary:
-- `benign`: 30 modeled features, 29 finite lower bounds, 30 finite upper bounds.
-- `malignant`: 29 modeled features, 29 finite lower bounds, 24 finite upper bounds.
+- `benign`: 30 modeled features, 28 finite lower bounds, 28 finite upper bounds.
+- `malignant`: 26 modeled features, 22 finite lower bounds, 21 finite upper bounds.
 
 Interpretation:
 - Breast Cancer decision ranges are often asymmetric,
@@ -178,7 +202,7 @@ Interpretation:
 Episode link:
 - Iris showed the method on cleaner geometry.
 - Wine extended it to richer multiclass overlap.
-- Breast Cancer shows the same method handling high-dimensional binary logic with dense threshold interactions.
+- Breast Cancer shows the same method handling binary logic with higher feature dimensionality than the previous benchmarks and dense threshold interactions.
 
 ---
 
