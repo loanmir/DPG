@@ -1,6 +1,10 @@
 import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+sys.path.insert(0, PROJECT_ROOT)
+
 from collections import defaultdict
 import re
 import pandas as pd
@@ -16,9 +20,9 @@ if __name__ == "__main__":
     parser.add_argument("--ds", "--dataset", type=str, default="iris", help="Basic dataset to be analyzed")
     parser.add_argument("--l", "--n_learners", type=int, default=5, help="Number of learners for the Random Forest")
     parser.add_argument("--model_name", type=str, default="RandomForestClassifier", help="Chosen tree-based ensemble model")
-    parser.add_argument("--dir", type=str, default="examples/", help="Directory to save results")
+    parser.add_argument("--dir", type=str, default=os.path.join(SCRIPT_DIR, "results"), help="Directory to save results")
     parser.add_argument("--plot", action='store_true', help="Plot the DPG, add the argument to use it as True")
-    parser.add_argument("--save_plot_dir", type=str, default="examples/", help="Directory to save the plot image")
+    parser.add_argument("--save_plot_dir", type=str, default=os.path.join(SCRIPT_DIR, "results"), help="Directory to save the plot image")
     parser.add_argument("--attribute", type=str, default=None, help="A specific node attribute to visualize")
     parser.add_argument("--communities", action='store_true', help="Boolean indicating whether to visualize communities, add the argument to use it as True")
     parser.add_argument("--clusters", action='store_true', help="Boolean indicating whether to visualize clusters, add the argument to use it as True")
@@ -29,7 +33,7 @@ if __name__ == "__main__":
     parser.add_argument("--pv", type=float, default=None, help="Override perc_var from config")
     args = parser.parse_args()
 
-    config_path="config.yaml"
+    config_path = os.path.join(PROJECT_ROOT, "config.yaml")
     try:
         with open(config_path) as f:
                 config = yaml.safe_load(f)
@@ -46,7 +50,9 @@ if __name__ == "__main__":
         pv = args.pv
     if args.t is not None:
         t = args.t
-        
+
+    os.makedirs(args.dir, exist_ok=True)
+
     df, df_edges, df_dpg_metrics, clusters, node_prob, confidence = test.test_dpg(datasets = args.ds,
                                         n_learners = args.l, 
                                         perc_var = pv, 
