@@ -599,6 +599,21 @@ def run_counterfactual_generation_dpg_dice(args):
         dpg_permitted_range = build_permitted_range_from_dpg_constraints(
             constraints, TARGET_CLASS, FEATURES_NAMES, train_df
         )
+
+        # Check if weak_constraints mode is enabled: extend DPG bounds to
+        # include the original sample value so DiCE has an easier path.
+        weak_constraints = getattr(config.counterfactual, 'weak_constraints', False)
+        if weak_constraints and dpg_permitted_range:
+            for feat, bounds in dpg_permitted_range.items():
+                orig_val = ORIGINAL_SAMPLE.get(feat)
+                if orig_val is not None:
+                    lo, hi = bounds
+                    dpg_permitted_range[feat] = [min(lo, orig_val), max(hi, orig_val)]
+            print(
+                f"INFO [dpg_dice]: weak_constraints=True — DPG bounds extended to"
+                f" include original sample values"
+            )
+
         if dpg_permitted_range:
             print(
                 f"INFO [dpg_dice]: Applied DPG bounds for {len(dpg_permitted_range)}"
