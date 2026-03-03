@@ -152,6 +152,7 @@ methods:
     # DiCE + DPG hybrid: DPG target-class bounds feed DiCE's permitted_range.
     # Merge priority (lowest→highest): DPG bounds < actionability < config overrides.
     generation_method: genetic
+    weak_constraints: false  # When true, extend DPG bounds to include the original sample value
     # proximity_weight: 0.5
     # diversity_weight: 1.0
     # maxiterations: 500
