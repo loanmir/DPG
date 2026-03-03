@@ -655,15 +655,26 @@ def run_counterfactual_generation_dpg_dice(args):
                 print(f"INFO [dpg_dice]: Config permitted_range overrides applied: {config_permitted_range}")
 
         # ------------------------------------------------------------------
-        # 5. Build features_to_vary from actionability
+        # 5. Build features_to_vary from actionability + DPG intel
+        #    Features without any DPG constraint for the target class are
+        #    treated as non-actionable (DPG found them irrelevant).
         # ------------------------------------------------------------------
         features_to_vary = [
             feat for feat in FEATURES_NAMES
             if dict_non_actionable.get(feat, "none") != "no_change"
+            and feat in dpg_permitted_range
         ]
-        if len(features_to_vary) == len(FEATURES_NAMES):
-            features_to_vary = 'all'
-        elif not features_to_vary:
+        dpg_frozen = [
+            feat for feat in FEATURES_NAMES
+            if feat not in dpg_permitted_range
+            and dict_non_actionable.get(feat, "none") != "no_change"
+        ]
+        if dpg_frozen:
+            print(
+                f"INFO [dpg_dice]: Freezing {len(dpg_frozen)} features with no DPG"
+                f" constraints for target class {TARGET_CLASS}: {dpg_frozen}"
+            )
+        if not features_to_vary:
             print("WARNING [dpg_dice]: No actionable features!")
             return None
 
