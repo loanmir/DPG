@@ -28,3 +28,5 @@ experiment_params:
 methods:
   dpg:
     verbose: false
+  dpg_dice:
+    weak_constraints: true

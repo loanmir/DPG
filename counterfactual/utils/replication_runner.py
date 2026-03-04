@@ -599,6 +599,21 @@ def run_counterfactual_generation_dpg_dice(args):
         dpg_permitted_range = build_permitted_range_from_dpg_constraints(
             constraints, TARGET_CLASS, FEATURES_NAMES, train_df
         )
+
+        # Check if weak_constraints mode is enabled: extend DPG bounds to
+        # include the original sample value so DiCE has an easier path.
+        weak_constraints = getattr(config.counterfactual, 'weak_constraints', False)
+        if weak_constraints and dpg_permitted_range:
+            for feat, bounds in dpg_permitted_range.items():
+                orig_val = ORIGINAL_SAMPLE.get(feat)
+                if orig_val is not None:
+                    lo, hi = bounds
+                    dpg_permitted_range[feat] = [min(lo, orig_val), max(hi, orig_val)]
+            print(
+                f"INFO [dpg_dice]: weak_constraints=True — DPG bounds extended to"
+                f" include original sample values"
+            )
+
         if dpg_permitted_range:
             print(
                 f"INFO [dpg_dice]: Applied DPG bounds for {len(dpg_permitted_range)}"
@@ -655,15 +670,26 @@ def run_counterfactual_generation_dpg_dice(args):
                 print(f"INFO [dpg_dice]: Config permitted_range overrides applied: {config_permitted_range}")
 
         # ------------------------------------------------------------------
-        # 5. Build features_to_vary from actionability
+        # 5. Build features_to_vary from actionability + DPG intel
+        #    Features without any DPG constraint for the target class are
+        #    treated as non-actionable (DPG found them irrelevant).
         # ------------------------------------------------------------------
         features_to_vary = [
             feat for feat in FEATURES_NAMES
             if dict_non_actionable.get(feat, "none") != "no_change"
+            and feat in dpg_permitted_range
         ]
-        if len(features_to_vary) == len(FEATURES_NAMES):
-            features_to_vary = 'all'
-        elif not features_to_vary:
+        dpg_frozen = [
+            feat for feat in FEATURES_NAMES
+            if feat not in dpg_permitted_range
+            and dict_non_actionable.get(feat, "none") != "no_change"
+        ]
+        if dpg_frozen:
+            print(
+                f"INFO [dpg_dice]: Freezing {len(dpg_frozen)} features with no DPG"
+                f" constraints for target class {TARGET_CLASS}: {dpg_frozen}"
+            )
+        if not features_to_vary:
             print("WARNING [dpg_dice]: No actionable features!")
             return None
 
