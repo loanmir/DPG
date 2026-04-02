@@ -12,12 +12,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, Any, List
-import fcntl
 
 
 class PersistentStatus(Enum):
@@ -76,7 +73,7 @@ def write_status(
     end_time: Optional[float] = None,
     error_message: Optional[str] = None,
 ) -> None:
-    """Write experiment status to file with file locking."""
+    """Write experiment status to file using atomic replacement."""
     status_file = get_status_file_path(dataset, method, output_dir)
     log_file = get_log_file_path(dataset, method, output_dir)
     
@@ -91,13 +88,12 @@ def write_status(
         log_file=str(log_file),
     )
     
-    # Write with file locking to prevent race conditions
-    with open(status_file, 'w') as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            json.dump(info.to_dict(), f, indent=2)
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    # Write to a temporary file then atomically replace the target to avoid
+    # partially-written JSON files across platforms (Windows/Linux/macOS).
+    tmp_file = status_file.with_suffix(status_file.suffix + '.tmp')
+    with open(tmp_file, 'w') as f:
+        json.dump(info.to_dict(), f, indent=2)
+    os.replace(tmp_file, status_file)
 
 
 def read_status(dataset: str, method: str, output_dir: pathlib.Path) -> Optional[ExperimentStatusInfo]:
@@ -109,11 +105,7 @@ def read_status(dataset: str, method: str, output_dir: pathlib.Path) -> Optional
     
     try:
         with open(status_file, 'r') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                data = json.load(f)
-            finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            data = json.load(f)
         return ExperimentStatusInfo.from_dict(data)
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
