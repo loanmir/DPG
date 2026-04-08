@@ -8,6 +8,8 @@ __pycache__/
 .env
 .venv/
 venv/
+.venv-1/
+venv-1/
 ENV/
 
 # Data files (keep specific patterns if needed)
