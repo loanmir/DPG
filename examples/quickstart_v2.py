@@ -23,6 +23,40 @@ import yaml
 from counterfactual.utils.dataset_loader import load_dataset as load_dataset_from_loader
 from counterfactual.utils.config_manager import DictConfig
 
+
+def build_perc_var_candidates(base_perc_var):
+    # Start from the configured value and progressively relax sparsity if plotting times out.
+    env_candidates = os.getenv("DPG_PERC_VAR_CANDIDATES")
+    if env_candidates:
+        raw_values = [v.strip() for v in env_candidates.split(",") if v.strip()]
+        candidates = [float(v) for v in raw_values]
+    else:
+        # If configured perc_var is extremely small, quickly jump to practical values.
+        if base_perc_var < 1e-6:
+            candidates = [base_perc_var, 1e-4, 1e-3, 1e-2, 5e-2, 1e-1]
+        else:
+            candidates = [
+                base_perc_var,
+                base_perc_var * 10,
+                base_perc_var * 100,
+                base_perc_var * 1_000,
+                1e-3,
+                1e-2,
+                5e-2,
+                1e-1,
+            ]
+
+    cleaned = []
+    for value in candidates:
+        value = float(value)
+        if value <= 0:
+            continue
+        # Keep values in a practical range for this library.
+        value = min(value, 0.5)
+        if value not in cleaned:
+            cleaned.append(value)
+    return cleaned
+
 def load_config(config_path):
     # Read YAML configuration used by the DPG library (percentile, thresholds, etc.)
     try:
@@ -103,18 +137,7 @@ def main():
     # Load DPG defaults from config.yaml
     config_data = load_config(config["config_path"])
     configured_perc_var = float(config_data["dpg"]["default"]["perc_var"])
-    # Optional override for renderability on very dense graphs.
-    # Set DPG_MIN_PERC_VAR_FOR_PLOT to enforce a lower bound at runtime.
-    min_perc_var_env = os.getenv("DPG_MIN_PERC_VAR_FOR_PLOT")
-    effective_perc_var = configured_perc_var
-    if min_perc_var_env:
-        min_perc_var_for_plot = float(min_perc_var_env)
-        effective_perc_var = max(configured_perc_var, min_perc_var_for_plot)
-    if effective_perc_var != configured_perc_var:
-        print(
-            f"INFO: Overriding perc_var from {configured_perc_var} to {effective_perc_var} "
-            "for a tractable graph render"
-        )
+    perc_var_candidates = build_perc_var_candidates(configured_perc_var)
 
     base_dir = PROJECT_ROOT
     # Load and clean the dataset
@@ -130,84 +153,102 @@ def main():
     metric_suffix, last_train = train_model_cv(
         model, features_matrix, labels, random_state=42
     )
+    if last_train is None:
+        raise RuntimeError("K-Fold training did not produce any train split.")
     X_train, y_train = last_train
 
-    # Compose a shared run id for all outputs
-    run_id = (
-        f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
-        f"_bl{config['num_trees']}_{metric_suffix}_perc_{effective_perc_var}"
-    )
-
-    # Build and explain DPG via the high-level API
-    target_names = np.unique(labels).astype(str).tolist()
-    explainer = DPGExplainer(
-        model=model,
-        feature_names=feature_names,
-        target_names=target_names,
-        config_file=config["config_path"],
-        dpg_config={
-            "dpg": {
-                "default": {
-                    "perc_var": effective_perc_var,
-                    "decimal_threshold": config_data["dpg"]["default"].get("decimal_threshold", 6),
-                    "n_jobs": config_data["dpg"]["default"].get("n_jobs", -1),
-                }
-            }
-        },
-    )
-    explanation = explainer.explain_global(
-        X_train.values,
-        communities=True,
-        community_threshold=0.2,
-    )
-
-    # Save class boundary summary
     os.makedirs(config["results_dir"], exist_ok=True)
-    class_boundaries_path = os.path.join(
-        config["results_dir"], f"{run_id}_dpg_class_boundaries.txt"
-    )
-    with open(class_boundaries_path, "w") as f:
-        for key, value in explanation.class_boundaries.items():
-            f.write(f"{key}: {value}\n")
+    target_names = np.unique(labels).astype(str).tolist()
 
-    # Save node and edge metrics
-    node_metrics_path = os.path.join(
-        config["results_dir"], f"{run_id}_node_metrics.csv"
-    )
-    explanation.node_metrics.to_csv(node_metrics_path, encoding="utf-8")
+    last_timeout_error = None
+    for effective_perc_var in perc_var_candidates:
+        run_id = (
+            f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
+            f"_bl{config['num_trees']}_{metric_suffix}_perc_{effective_perc_var}"
+        )
 
-    edge_metrics_path = os.path.join(
-        config["results_dir"], f"{run_id}_edge_metrics.csv"
-    )
-    explanation.edge_metrics.to_csv(edge_metrics_path, encoding="utf-8")
+        print(f"INFO: Attempting DPG explain/plot with perc_var={effective_perc_var}")
+        explainer = DPGExplainer(
+            model=model,
+            feature_names=feature_names,
+            target_names=target_names,
+            config_file=config["config_path"],
+            dpg_config={
+                "dpg": {
+                    "default": {
+                        "perc_var": effective_perc_var,
+                        "decimal_threshold": config_data["dpg"]["default"].get("decimal_threshold", 6),
+                        "n_jobs": config_data["dpg"]["default"].get("n_jobs", -1),
+                    }
+                }
+            },
+        )
+        explanation = explainer.explain_global(
+            X_train.values,
+            communities=True,
+            community_threshold=0.2,
+        )
 
-    # Save communities
-    communities_path = os.path.join(
-        config["results_dir"], f"{run_id}_dpg_communities.txt"
-    )
-    if explanation.communities is not None:
-        from metrics.graph import GraphMetrics
+        # Save class boundary summary
+        class_boundaries_path = os.path.join(
+            config["results_dir"], f"{run_id}_dpg_class_boundaries.txt"
+        )
+        with open(class_boundaries_path, "w") as f:
+            for key, value in explanation.class_boundaries.items():
+                f.write(f"{key}: {value}\n")
 
-        GraphMetrics.communities_to_csv(explanation.communities, communities_path)
+        # Save node and edge metrics
+        node_metrics_path = os.path.join(
+            config["results_dir"], f"{run_id}_node_metrics.csv"
+        )
+        explanation.node_metrics.to_csv(node_metrics_path, encoding="utf-8")
 
-    # Render plots
-    run_name = f"{run_id}_DPG"
-    explainer.plot(
-        run_name,
-        explanation=explanation,
-        save_dir=config["results_dir"],
-        class_flag=False,
-        show=False,
-        export_pdf=True,
-    )
-    explainer.plot_communities(
-        run_name,
-        explanation=explanation,
-        save_dir=config["results_dir"],
-        class_flag=True,
-        show=False,
-        export_pdf=True,
-    )
+        edge_metrics_path = os.path.join(
+            config["results_dir"], f"{run_id}_edge_metrics.csv"
+        )
+        explanation.edge_metrics.to_csv(edge_metrics_path, encoding="utf-8")
+
+        # Save communities
+        communities_path = os.path.join(
+            config["results_dir"], f"{run_id}_dpg_communities.txt"
+        )
+        if explanation.communities is not None:
+            from metrics.graph import GraphMetrics
+
+            GraphMetrics.communities_to_csv(explanation.communities, communities_path)
+
+        run_name = f"{run_id}_DPG"
+        try:
+            # Render plots; on Graphviz timeout try a higher perc_var.
+            explainer.plot(
+                run_name,
+                explanation=explanation,
+                save_dir=config["results_dir"],
+                class_flag=False,
+                show=False,
+                export_pdf=True,
+            )
+            explainer.plot_communities(
+                run_name,
+                explanation=explanation,
+                save_dir=config["results_dir"],
+                class_flag=True,
+                show=False,
+                export_pdf=True,
+            )
+            print(f"INFO: Plotting completed with perc_var={effective_perc_var}")
+            return
+        except TimeoutError as err:
+            last_timeout_error = err
+            print(
+                f"WARNING: Plotting timed out with perc_var={effective_perc_var}. "
+                "Retrying with a higher perc_var..."
+            )
+
+    raise RuntimeError(
+        "All perc_var attempts timed out during plotting. "
+        "Set DPG_PERC_VAR_CANDIDATES to a more aggressive list (e.g. 0.01,0.05,0.1)."
+    ) from last_timeout_error
 
 
 if __name__ == "__main__":
