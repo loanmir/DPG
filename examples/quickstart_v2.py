@@ -42,6 +42,7 @@ def load_dataset(dataset_name, base_dir):
                 "dataset": dataset_name,
                 "dataset_url": "https://huggingface.co/datasets/MLLab-TS/german_credit/resolve/main/dataset.csv",
                 "target_column": "foreign_worker",
+                "categorical_encoding": "onehot",
                 # Preserve prior quickstart behavior where first CSV column was used as index.
                 "drop_columns": ["default"],
                 "missing_values": "fill",
@@ -95,13 +96,20 @@ def main():
         "num_trees": 10,
         "run_tag": "CustomDPG",
         "random_state": 27,
+        "min_perc_var_for_plot": 0.05,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
         "results_dir": os.path.join(SCRIPT_DIR, "results"),
     }
 
     # Load DPG defaults from config.yaml
     config_data = load_config(config["config_path"])
-    perc_var = config_data["dpg"]["default"]["perc_var"]
+    configured_perc_var = float(config_data["dpg"]["default"]["perc_var"])
+    effective_perc_var = max(configured_perc_var, config["min_perc_var_for_plot"])
+    if effective_perc_var != configured_perc_var:
+        print(
+            f"INFO: Overriding perc_var from {configured_perc_var} to {effective_perc_var} "
+            "for a tractable graph render"
+        )
 
     base_dir = PROJECT_ROOT
     # Load and clean the dataset
@@ -122,7 +130,7 @@ def main():
     # Compose a shared run id for all outputs
     run_id = (
         f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
-        f"_bl{config['num_trees']}_{metric_suffix}_perc_{perc_var}"
+        f"_bl{config['num_trees']}_{metric_suffix}_perc_{effective_perc_var}"
     )
 
     # Build and explain DPG via the high-level API
@@ -132,6 +140,15 @@ def main():
         feature_names=feature_names,
         target_names=target_names,
         config_file=config["config_path"],
+        dpg_config={
+            "dpg": {
+                "default": {
+                    "perc_var": effective_perc_var,
+                    "decimal_threshold": config_data["dpg"]["default"].get("decimal_threshold", 6),
+                    "n_jobs": config_data["dpg"]["default"].get("n_jobs", -1),
+                }
+            }
+        },
     )
     explanation = explainer.explain_global(
         X_train.values,
@@ -175,6 +192,7 @@ def main():
         explanation=explanation,
         save_dir=config["results_dir"],
         class_flag=False,
+        show=False,
         export_pdf=True,
     )
     explainer.plot_communities(
@@ -182,6 +200,7 @@ def main():
         explanation=explanation,
         save_dir=config["results_dir"],
         class_flag=True,
+        show=False,
         export_pdf=True,
     )
 
