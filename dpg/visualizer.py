@@ -1,13 +1,12 @@
 import os
 import re
+import subprocess
 import warnings
 import numpy as np
 import pandas as pd
 import networkx as nx
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
-from graphviz import Source
-from graphviz.backend.execute import ExecutableNotFound
 import matplotlib.patches as mpatches
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
@@ -91,16 +90,39 @@ def _graphviz_not_found_error() -> RuntimeError:
 
 
 def _pipe_graph_png_with_fallback(dot_source: str, sanitizer) -> bytes:
+    timeout_sec = float(os.getenv("DPG_DOT_TIMEOUT_SEC", "120"))
+
+    def _pipe_with_timeout(source: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                ["dot", "-Tpng"],
+                input=source.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_sec,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise _graphviz_not_found_error() from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Graphviz rendering timed out after {timeout_sec:.0f}s. "
+                "Increase 'dpg.default.perc_var' or reduce model complexity to keep the graph renderable."
+            ) from exc
+
+        if completed.returncode != 0:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Graphviz 'dot' failed with exit code {completed.returncode}: {stderr}")
+        return completed.stdout
+
     try:
-        return Source(dot_source).pipe(format="png")
-    except ExecutableNotFound as exc:
-        raise _graphviz_not_found_error() from exc
+        return _pipe_with_timeout(dot_source)
     except Exception as first_exc:
+        if isinstance(first_exc, TimeoutError):
+            raise
         print(f"Plotting failed with {type(first_exc).__name__}; retrying with sanitized DOT source.")
         try:
-            return Source(sanitizer(dot_source)).pipe(format="png")
-        except ExecutableNotFound as exc:
-            raise _graphviz_not_found_error() from exc
+            return _pipe_with_timeout(sanitizer(dot_source))
         except Exception:
             raise first_exc
 
