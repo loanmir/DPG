@@ -55,5 +55,6 @@ docs/_build/
 
 outputs/
 examples/results
+examples/results_v2
 examples/results_new
 wandb/
