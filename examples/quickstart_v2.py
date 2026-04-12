@@ -96,7 +96,6 @@ def main():
         "num_trees": 10,
         "run_tag": "CustomDPG",
         "random_state": 27,
-        "min_perc_var_for_plot": 0.05,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
         "results_dir": os.path.join(SCRIPT_DIR, "results_v2"),
     }
@@ -104,7 +103,13 @@ def main():
     # Load DPG defaults from config.yaml
     config_data = load_config(config["config_path"])
     configured_perc_var = float(config_data["dpg"]["default"]["perc_var"])
-    effective_perc_var = max(configured_perc_var, config["min_perc_var_for_plot"])
+    # Optional override for renderability on very dense graphs.
+    # Set DPG_MIN_PERC_VAR_FOR_PLOT to enforce a lower bound at runtime.
+    min_perc_var_env = os.getenv("DPG_MIN_PERC_VAR_FOR_PLOT")
+    effective_perc_var = configured_perc_var
+    if min_perc_var_env:
+        min_perc_var_for_plot = float(min_perc_var_env)
+        effective_perc_var = max(configured_perc_var, min_perc_var_for_plot)
     if effective_perc_var != configured_perc_var:
         print(
             f"INFO: Overriding perc_var from {configured_perc_var} to {effective_perc_var} "
