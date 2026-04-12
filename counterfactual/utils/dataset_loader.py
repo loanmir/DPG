@@ -24,7 +24,7 @@ import os
 import urllib.request
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
 
 def _resolve_local_dataset_path(dataset_name: str, url: str, repo_root=None) -> str:
@@ -212,18 +212,68 @@ def _load_csv_dataset(config, repo_root=None):
             print(f"INFO: Target label mapping: {dict(zip(le.classes_, le.transform(le.classes_)))}")
     
     # Encode categorical feature variables
+    encoding_strategy = str(getattr(config.data, 'categorical_encoding', 'label')).lower()
     features_df_encoded = features_df.copy()
-    
-    for col in features_df.columns:
-        col_dtype = features_df[col].dtype
-        if col_dtype == 'object' or col_dtype.name == 'category':
-            print(f"INFO: Encoding categorical feature: {col}")
-            le = LabelEncoder()
-            features_df_encoded[col] = le.fit_transform(features_df[col].astype(str))
-            label_encoders[col] = le
-        elif col_dtype == 'bool':
-            features_df_encoded[col] = features_df[col].astype(int)
-    
+
+    if encoding_strategy == 'onehot':
+        categorical_cols = [
+            col
+            for col in features_df.columns
+            if features_df[col].dtype == 'object' or features_df[col].dtype.name == 'category'
+        ]
+
+        if categorical_cols:
+            print(f"INFO: One-hot encoding categorical features: {categorical_cols}")
+            onehot = OneHotEncoder(handle_unknown='ignore', sparse_output=False, dtype=np.float64)
+            encoded_array = onehot.fit_transform(features_df[categorical_cols].astype(str))
+            encoded_col_names = onehot.get_feature_names_out(categorical_cols).tolist()
+
+            numeric_df = features_df.drop(columns=categorical_cols).copy()
+            bool_cols = [c for c in numeric_df.columns if numeric_df[c].dtype == 'bool']
+            for col in bool_cols:
+                numeric_df[col] = numeric_df[col].astype(int)
+
+            encoded_df = pd.DataFrame(encoded_array, columns=encoded_col_names, index=features_df.index)
+            features_df_encoded = pd.concat([numeric_df, encoded_df], axis=1)
+            label_encoders['features_onehot'] = onehot
+
+            numeric_cols = list(numeric_df.columns)
+            all_cols = list(features_df_encoded.columns)
+            continuous_indices = [all_cols.index(c) for c in numeric_cols if c in all_cols]
+            categorical_indices = [all_cols.index(c) for c in encoded_col_names if c in all_cols]
+
+            if config and hasattr(config.data, 'variable_features') and config.data.variable_features:
+                variable_features = config.data.variable_features
+                expanded_variable_cols = []
+                for feature in variable_features:
+                    if feature in all_cols:
+                        expanded_variable_cols.append(feature)
+                    else:
+                        expanded_variable_cols.extend(
+                            [c for c in all_cols if c.startswith(f"{feature}_")]
+                        )
+                variable_indices = sorted({all_cols.index(c) for c in expanded_variable_cols if c in all_cols})
+            else:
+                variable_indices = list(range(len(all_cols)))
+        else:
+            print("INFO: One-hot encoding requested, but no categorical columns were detected")
+            for col in features_df.columns:
+                if features_df[col].dtype == 'bool':
+                    features_df_encoded[col] = features_df[col].astype(int)
+            continuous_indices, categorical_indices, variable_indices = determine_feature_types(features_df_encoded, config)
+    else:
+        for col in features_df.columns:
+            col_dtype = features_df[col].dtype
+            if col_dtype == 'object' or col_dtype.name == 'category':
+                print(f"INFO: Encoding categorical feature: {col}")
+                le = LabelEncoder()
+                features_df_encoded[col] = le.fit_transform(features_df[col].astype(str))
+                label_encoders[col] = le
+            elif col_dtype == 'bool':
+                features_df_encoded[col] = features_df[col].astype(int)
+
+        continuous_indices, categorical_indices, variable_indices = determine_feature_types(features_df_encoded, config)
+
     features = features_df_encoded.values.astype(float)
     feature_names = list(features_df_encoded.columns)
     
@@ -244,9 +294,6 @@ def _load_csv_dataset(config, repo_root=None):
         print(f"INFO: Classes: {unique_labels}, distribution: {np.bincount(labels)}")
     else:
         print(f"INFO: Classes: {len(unique_labels)} unique values")
-    
-    # Determine feature types
-    continuous_indices, categorical_indices, variable_indices = determine_feature_types(features_df_encoded, config)
     
     return {
         'features': features,
