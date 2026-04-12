@@ -98,7 +98,7 @@ def main():
         "random_state": 27,
         "min_perc_var_for_plot": 0.05,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": os.path.join(SCRIPT_DIR, "results"),
+        "results_dir": os.path.join(SCRIPT_DIR, "results_v2"),
     }
 
     # Load DPG defaults from config.yaml
