@@ -55,6 +55,5 @@ docs/_build/
 
 outputs/
 examples/results
-examples/results_v2
-examples/results_new
+examples/results_v2_oneHot_wCat
 wandb/

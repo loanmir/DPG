@@ -131,7 +131,7 @@ def main():
         "run_tag": "CustomDPG",
         "random_state": 27,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": os.path.join(SCRIPT_DIR, "results_v2"),
+        "results_dir": os.path.join(SCRIPT_DIR, "results_v2_oneHot_wCat"),
     }
 
     # Load DPG defaults from config.yaml
