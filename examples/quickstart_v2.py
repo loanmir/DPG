@@ -2,7 +2,7 @@
 DPG Analysis Pipeline - Example Script
 =====================================
 This script demonstrates a complete workflow for:
-1. Training a Random Forest model
+1. Training a Random Forest model on a tabular dataset with one-hot encoding for categorical features.
 2. Generating Decision Predicate Graphs (DPG)
 3. Extracting and visualizing interpretability metrics
 """
@@ -70,12 +70,13 @@ def load_config(config_path):
 
 def load_dataset(dataset_name, base_dir):
     # Reuse the shared counterfactual dataset loader to keep ingestion logic centralized.
-    loader_config = DictConfig(
+    #DictConfig imported from counterfactual.utils.config_manager to avoid dependency on hydra in this quickstart example.
+    loader_config = DictConfig( 
         {
             "data": {
                 "dataset": dataset_name,
-                "dataset_url": "https://huggingface.co/datasets/MLLab-TS/german_credit/resolve/main/dataset.csv",
-                "target_column": "foreign_worker",
+                "dataset_url": "https://huggingface.co/datasets/thomask1018/credit_card_approval/resolve/main/loan_data.csv",
+                "target_column": "loan_status",
                 "categorical_encoding": "onehot",
                 # Preserve prior quickstart behavior where first CSV column was used as index.
                 "drop_columns": ["default"],
@@ -84,8 +85,13 @@ def load_dataset(dataset_name, base_dir):
             }
         }
     )
+    # load_dataset_from_loader will handle downloading, one-hot encoding, 
+    # and cleaning (infinities, missing values) as per the loader_config. 
+    # It returns a dict with features_df, labels, and feature_names.
+    # imported as load_dataset from counterfactual.utils.dataset_loader
     dataset_info = load_dataset_from_loader(loader_config, repo_root=base_dir)
 
+    # Does the same thing as v1!
     features_df = dataset_info["features_df"]
     labels = pd.Series(dataset_info["labels"])
     feature_names = features_df.columns
@@ -126,12 +132,12 @@ def main():
     # =============================================================================
     # Tutorial note: adjust these values to point at your dataset and control the run.
     config = {
-        "dataset_name": "german_credit",
+        "dataset_name": "credit_card_approval",
         "num_trees": 10,
         "run_tag": "CustomDPG",
         "random_state": 27,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": os.path.join(SCRIPT_DIR, "results_v2_oneHot_wCat"),
+        "results_dir": os.path.join(SCRIPT_DIR, "results_credit_card_approval"),
     }
 
     # Load DPG defaults from config.yaml
@@ -161,12 +167,15 @@ def main():
     target_names = np.unique(labels).astype(str).tolist()
 
     last_timeout_error = None
-    for effective_perc_var in perc_var_candidates:
+    for effective_perc_var in perc_var_candidates: # iterating through all possible values for per_vars until we find one that doesn't time out during plotting
         run_id = (
             f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
             f"_bl{config['num_trees']}_{metric_suffix}_perc_{effective_perc_var}"
         )
 
+        # If plotting times out due to graph complexity, 
+        # we catch the error and retry with a higher perc_var to simplify the graph.
+        # Building a DPG and explaining it with high level API
         print(f"INFO: Attempting DPG explain/plot with perc_var={effective_perc_var}")
         explainer = DPGExplainer(
             model=model,

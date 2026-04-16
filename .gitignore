@@ -55,5 +55,7 @@ docs/_build/
 
 outputs/
 examples/results
-examples/results_v2_oneHot_wCat
+examples/results_german_credit
+examples/results_credit_card_approval
+examples/results_iris
 wandb/
