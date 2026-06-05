@@ -36,20 +36,32 @@ def load_config(config_path):
 
 def load_dataset(dataset_name, base_dir):
     # Load CSV dataset from datasets/ and split features/labels
-    dataset_path = os.path.join(base_dir, "datasets", dataset_name)
-    dataset_raw = pd.read_csv(dataset_path, index_col=0)
+    dataset_path = os.path.join(base_dir, "datasets/dummy_dataset", dataset_name)
+    dataset_raw = pd.read_csv(dataset_path)
 
     features = dataset_raw.iloc[:, :-1]
     target_column = dataset_raw.columns[-1]
     feature_names = dataset_raw.columns[:-1]
     labels = dataset_raw[target_column]
 
+    # Capture original feature names before one-hot encoding (so the rest of the
+    # pipeline still sees the original column names, e.g. for plots / DPG metrics).
+    original_feature_names = list(features.columns)
+
+    # One-hot encode categorical (object/string) columns so they survive downstream
+    # numeric operations like .mean() / .fillna(). Numeric columns are passed through.
+    features = pd.get_dummies(features, drop_first=False)
+
     # Clean data: handle infinities and missing values
     features = features.replace([np.inf, -np.inf], np.nan).fillna(features.mean())
     features_matrix = np.round(features, 2)
 
+    # Use the post-encoding column names so DPG and the visualizer see the dummy
+    # columns (e.g. person_home_ownership_RENT) rather than the originals.
+    feature_names = list(features_matrix.columns)
+
     print("Size of X", features_matrix.shape)
-    return features_matrix, labels, feature_names
+    return features_matrix, labels, feature_names, original_feature_names
 
 
 def train_model_cv(model, features_matrix, labels, random_state):
@@ -115,12 +127,12 @@ def main():
     # =============================================================================
     # Tutorial note: adjust these values to point at your dataset and control the run.
     config = {
-        "dataset_name": "custom.csv",
+        "dataset_name": "dummy_dataset.csv",
         "num_trees": 10,
         "run_tag": "CustomDPG",
         "random_state": 27,
         "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": os.path.join(SCRIPT_DIR, "results"),
+        "results_dir": os.path.join(SCRIPT_DIR, "results_dummy"),
     }
 
     # Load DPG defaults from config.yaml
@@ -129,7 +141,7 @@ def main():
 
     base_dir = PROJECT_ROOT
     # Load and clean the dataset
-    features_matrix, labels, feature_names = load_dataset(
+    features_matrix, labels, feature_names, original_feature_names = load_dataset(
         config["dataset_name"], base_dir
     )
 
