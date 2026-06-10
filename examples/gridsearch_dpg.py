@@ -68,10 +68,13 @@ DEFAULT_DATASETS = [
     "toy_cat2_gender_ownership.csv",
     "toy_cat1_num1_ownership_age.csv",
     "toy_cat2_num1_gender_ownership_age.csv",
+    "toy_cat2_3way_ownership_gender.csv",
+    "toy_cat2_num1_age_interaction.csv",
+    "toy_cat2_num1_age_required.csv",
 ]
 
 # Default hyper-parameter grid
-DEFAULT_PERC_VARS = [0.01, 0.05, 0.10]
+DEFAULT_PERC_VARS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.10]
 DEFAULT_DECIMAL_THRESHOLDS = [1, 2, 3]
 DEFAULT_COMMUNITY_THRESHOLDS = [0.10, 0.20, 0.30]
 
