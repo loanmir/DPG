@@ -1,0 +1,31 @@
+person_education,person_age,loan_status
+Bachelor,25.0,1
+High School,25.0,0
+High School,22.0,1
+Bachelor,26.0,1
+Master,26.0,1
+Associate,26.0,0
+Bachelor,22.0,1
+Associate,24.0,0
+Associate,23.0,0
+Master,23.0,1
+Associate,26.0,0
+Master,23.0,1
+High School,22.0,1
+Bachelor,23.0,1
+High School,24.0,0
+Associate,26.0,0
+High School,22.0,1
+Associate,24.0,0
+Associate,23.0,0
+Master,21.0,1
+Master,22.0,1
+Bachelor,23.0,1
+Master,22.0,1
+High School,24.0,0
+Bachelor,24.0,1
+High School,23.0,0
+High School,26.0,0
+Associate,23.0,0
+Associate,23.0,0
+Master,23.0,1
