@@ -14,7 +14,8 @@ ENV/
 
 # Data files (keep specific patterns if needed)
 *.jpg
-*.csv
+custom.csv
+dataset.csv
 *.txt
 !docs/requirements.txt
 
