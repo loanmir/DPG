@@ -463,16 +463,34 @@ def plot_dpg_communities(
         colormap_edge = cm.Greys  # Colormap edges
         max_edge_value = df_edges['Weight'].max()
         min_edge_value = df_edges['Weight'].min()
-        norm_edge = mcolors.Normalize(vmin=min_edge_value, vmax=max_edge_value)
+        # Use a power-law normalization so low-weight edges are still visible
+        # (otherwise the Greys colormap maps the minimum weight to near-black
+        # and the line disappears against a white background).
+        if max_edge_value > min_edge_value and max_edge_value > 0:
+            norm_edge = mcolors.PowerNorm(
+                gamma=0.4, vmin=min_edge_value, vmax=max_edge_value
+            )
+        else:
+            norm_edge = mcolors.Normalize(vmin=0, vmax=1)
+        # Minimum line color brightness: 0.0 = black, 1.0 = white.
+        # 0.45 keeps even the lightest edge clearly visible.
+        min_color_value = 0.45
+        # Minimum edge penwidth so thin low-weight edges remain visible.
+        min_penwidth = 1.5
+        max_penwidth = 4.0
         for index, row in df_edges.iterrows():
             edge_value = row['Weight']
-            color = colormap_edge(norm_edge(edge_value))
+            norm_val = float(norm_edge(edge_value))
+            # Rescale colormap output to [min_color_value, 1.0] so the
+            # lightest edge still has a visible gray.
+            lightness = min_color_value + (1.0 - min_color_value) * norm_val
+            color = colormap_edge(lightness)
             color_hex = "#{:02x}{:02x}{:02x}".format(
                 int(color[0] * 255),
                 int(color[1] * 255),
                 int(color[2] * 255),
             )
-            penwidth = 1 + 3 * norm_edge(edge_value)
+            penwidth = min_penwidth + (max_penwidth - min_penwidth) * norm_val
 
             change_edge_color(dot, row['Source_id'], row['Target_id'], new_color=color_hex, new_width=penwidth)
 
