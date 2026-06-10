@@ -163,8 +163,10 @@ def _build_dot(
     visualization_config: dict,
 ) -> graphviz.Digraph:
     """Rebuild a Graphviz Digraph using the (possibly rewritten) labels."""
-    graph_attrs = visualization_config.get("graph", {}).get("graph_attrs", {})
-    node_attrs = visualization_config.get("graph", {}).get("node_attrs", {})
+    viz = visualization_config.get("dpg", {}).get("visualization", {})
+    graph_attrs = viz.get("graph_attrs", {})
+    node_attrs = viz.get("node_attrs", {})
+    class_node_attrs = viz.get("class_node", {})
 
     final_graph_attr = {
         "bgcolor": graph_attrs.get("bgcolor"),
@@ -178,11 +180,7 @@ def _build_dot(
     final_node_attr = {k: v for k, v in final_node_attr.items() if v is not None}
 
     default_fillcolor = node_attrs.get("fillcolor")
-    class_fillcolor = (
-        visualization_config.get("graph", {})
-        .get("class_node", {})
-        .get("fillcolor")
-    )
+    class_fillcolor = class_node_attrs.get("fillcolor") or default_fillcolor
 
     dot = graphviz.Digraph(
         "dpg_categorical",
@@ -199,9 +197,14 @@ def _build_dot(
             .replace("]", "\\]")
         )
 
-    # First pass: declare every node with its (possibly rewritten) label.
+    # First pass: declare every real node with its (possibly rewritten) label.
+    # The structure payload mixes real nodes with edge pseudo-nodes whose id
+    # contains ``->`` and have an empty label; we skip those (graphviz will
+    # render them implicitly when we add the matching edges).
     for node in structure.get("nodes", []):
         node_id = str(node["id"])
+        if "->" in node_id:
+            continue
         label = label_map.get(node_id, str(node.get("label", "")))
         if label.startswith("Class"):
             fillcolor = class_fillcolor or default_fillcolor
@@ -215,13 +218,37 @@ def _build_dot(
             fillcolor=fillcolor,
         )
 
-    # Second pass: add edges, mapping the encoded source/target strings to
-    # the actual node ids (json_graph uses ``source``/``target`` keys).
+    # Second pass: add edges. The structure stores edges in NetworkX
+    # ``node_link`` format under ``graph.edges`` (each entry has
+    # ``source``/``target``/``weight``). We mirror the original ``generate_dot``
+    # behaviour by emitting each edge with its weight as the label so the
+    # rendered PNG looks like the original.
     graph_data = structure.get("graph", {})
-    for link in graph_data.get("links", []):
+    raw_edges = graph_data.get("edges", graph_data.get("links", []))
+    # Sort by weight descending to match ``generate_dot``'s ``sorted(dfg.items(),
+    # key=lambda item: item[1])`` ordering. This keeps node-declaration order
+    # consistent with the original dot.
+    def _edge_weight(link):
+        try:
+            return float(link.get("weight", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    sorted_edges = sorted(raw_edges, key=_edge_weight, reverse=True)
+    for link in sorted_edges:
         src = str(link["source"])
         dst = str(link["target"])
-        dot.edge(src, dst, penwidth="1", fontsize="18")
+        weight = link.get("weight")
+        if weight is None:
+            dot.edge(src, dst, penwidth="1", fontsize="18")
+        else:
+            dot.edge(
+                src,
+                dst,
+                label=str(weight),
+                penwidth="1",
+                fontsize="18",
+            )
 
     return dot
 
@@ -330,11 +357,57 @@ def _process_subdir(
 # ---------------------------------------------------------------------------
 
 def _iter_subdirs(root: str) -> List[str]:
-    return sorted(
+    """Return subdirs sorted in a meaningful order for the gridsearch runs.
+
+    Each subdir name follows the pattern::
+
+        ds=<dataset>_pv=<perc_var>_dt=<decimal_threshold>_ct=<community_threshold>
+
+    We sort by ``(dataset asc, perc_var desc, dt asc, ct asc)`` so the first
+    results are the densest (``perc_var=0.1``) variants of the alphabetically
+    first dataset.
+    """
+
+
+    def _sort_key(entry: str):
+        name = os.path.basename(entry.rstrip(os.sep))
+        # Pattern: ``ds=<dataset>_pv=<pv>_dt=<dt>_ct=<ct>``. The dataset
+        # portion may itself contain underscores, so strip the well-known
+        # trailing tokens one at a time from the right.
+        ds = name
+        ct_s = dt_s = pv_s = None
+        if "_ct=" in ds:
+            ds, ct_s = ds.rsplit("_ct=", 1)
+        if "_dt=" in ds:
+            ds, dt_s = ds.rsplit("_dt=", 1)
+        if "_pv=" in ds:
+            ds, pv_s = ds.rsplit("_pv=", 1)
+        # ``ds`` still starts with the ``ds=`` prefix - drop it.
+        if ds.startswith("ds="):
+            ds = ds[len("ds="):]
+
+        try:
+            pv = float(pv_s) if pv_s is not None else 0.0
+        except ValueError:
+            pv = 0.0
+        try:
+            dt = int(dt_s) if dt_s is not None else 0
+        except ValueError:
+            dt = 0
+        try:
+            ct = float(ct_s) if ct_s is not None else 0.0
+        except ValueError:
+            ct = 0.0
+        # Negate perc_var so larger values sort first.
+        return (0, ds, -pv, dt, ct, name)
+
+    subdirs = [
         entry
         for entry in (os.path.join(root, name) for name in os.listdir(root))
         if os.path.isdir(entry)
-    )
+    ]
+    subdirs.sort(key=_sort_key)
+    return subdirs
 
 
 def _load_visualization_config(config_path: str) -> dict:
