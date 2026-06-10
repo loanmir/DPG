@@ -71,6 +71,11 @@ DEFAULT_DATASETS = [
     "toy_cat2_3way_ownership_gender.csv",
     "toy_cat2_num1_age_interaction.csv",
     "toy_cat2_num1_age_required.csv",
+    "toy_cat1_education_5val.csv",
+    "toy_cat1_loan_intent_6val.csv",
+    "toy_cat1_num1_education_age.csv",
+    "toy_cat1_num1_loan_intent_age.csv",
+    "toy_cat2_education_intent.csv",
 ]
 
 # Default hyper-parameter grid

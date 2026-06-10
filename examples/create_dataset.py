@@ -224,6 +224,49 @@ def _label_cat2_age_required(df: pd.DataFrame) -> pd.Series:
     return pd.Series(out, index=df.index)
 
 
+# -- New recipes using high-cardinality categoricals ------------------------
+
+def _label_education_only(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if education in {Master, Bachelor, Doctorate}, else class 0.
+    Pure 5-value categorical -> expect 4-5 OHE predicates linked in a chain.
+    """
+    return df["person_education"].isin(["Master", "Bachelor", "Doctorate"]).astype(int)
+
+
+def _label_loan_intent_only(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if loan_intent in {VENTURE, EDUCATION, HOMEIMPROVEMENT}, else class 0.
+    6-value categorical -> expect rich chain.
+    """
+    return df["loan_intent"].isin(["VENTURE", "EDUCATION", "HOMEIMPROVEMENT"]).astype(int)
+
+
+def _label_education_num1(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if education in {Master, Bachelor} OR age<23; else class 0.
+    Combines a 5-value categorical with a numerical.
+    """
+    edu = df["person_education"].isin(["Master", "Bachelor"])
+    young = (df["person_age"] < 23)
+    return (edu | young).astype(int)
+
+
+def _label_intent_num1(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if loan_intent in {VENTURE, EDUCATION} OR age<23; else class 0.
+    """
+    intent = df["loan_intent"].isin(["VENTURE", "EDUCATION"])
+    young = (df["person_age"] < 23)
+    return (intent | young).astype(int)
+
+
+def _label_education_intent(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if loan_intent in {VENTURE, EDUCATION, HOMEIMPROVEMENT}
+               OR education in {Master, Doctorate, Bachelor}; else class 0.
+    Two high-card categoricals interacting -> chains on BOTH.
+    """
+    intent = df["loan_intent"].isin(["VENTURE", "EDUCATION", "HOMEIMPROVEMENT"])
+    edu = df["person_education"].isin(["Master", "Doctorate", "Bachelor"])
+    return (intent | edu).astype(int)
+
+
 # -- Default recipe list ----------------------------------------------------
 
 DEFAULT_RECIPES: List[Recipe] = [
@@ -283,6 +326,42 @@ DEFAULT_RECIPES: List[Recipe] = [
         target_col="loan_status",
         label_fn=_label_cat2_age_required,
         description="2 categoricals + 1 numerical (3-branch rule)",
+    ),
+    # -- High-cardinality categoricals (5-6 values) -> richer chains -----
+    Recipe(
+        name="cat1_education_5val",
+        feature_cols=["person_education"],
+        target_col="loan_status",
+        label_fn=_label_education_only,
+        description="1 categorical (person_education, 5 values) + 0 numerical",
+    ),
+    Recipe(
+        name="cat1_loan_intent_6val",
+        feature_cols=["loan_intent"],
+        target_col="loan_status",
+        label_fn=_label_loan_intent_only,
+        description="1 categorical (loan_intent, 6 values) + 0 numerical",
+    ),
+    Recipe(
+        name="cat1_num1_education_age",
+        feature_cols=["person_education", "person_age"],
+        target_col="loan_status",
+        label_fn=_label_education_num1,
+        description="1 high-card categorical (education) + 1 numerical (age)",
+    ),
+    Recipe(
+        name="cat1_num1_loan_intent_age",
+        feature_cols=["loan_intent", "person_age"],
+        target_col="loan_status",
+        label_fn=_label_intent_num1,
+        description="1 high-card categorical (loan_intent) + 1 numerical (age)",
+    ),
+    Recipe(
+        name="cat2_education_intent",
+        feature_cols=["person_education", "loan_intent"],
+        target_col="loan_status",
+        label_fn=_label_education_intent,
+        description="2 high-card categoricals (5 + 6 values) -- chains on BOTH",
     ),
 ]
 
