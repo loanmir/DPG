@@ -61,3 +61,6 @@ examples/results_credit_card_approval
 examples/results_iris
 examples/results_dummy
 wandb/
+
+examples/results_gridsearch
+datasets/dummy_dataset
