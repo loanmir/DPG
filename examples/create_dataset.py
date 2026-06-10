@@ -178,6 +178,52 @@ def _label_cat2_num1(df: pd.DataFrame) -> pd.Series:
     return pd.Series(out, index=df.index)
 
 
+# -- Rich-chain recipes (force linked same-cat predicates) -----------------
+
+def _label_cat2_3way(df: pd.DataFrame) -> pd.Series:
+    """3-way home_ownership split with gender interaction.
+    Class 0 if OWN; class 1 if MORTGAGE & female; class 0 if MORTGAGE & male;
+    class 1 if RENT & female; class 0 if RENT & male.
+    Forcing all 3 OHE columns of home_ownership to interact with gender
+    should produce a chain of linked same-cat predicates.
+    """
+    out = np.zeros(len(df), dtype=int)
+    is_female = (df["person_gender"] == "female")
+    out[(df["person_home_ownership"] == "MORTGAGE") & is_female] = 1
+    out[(df["person_home_ownership"] == "RENT") & is_female] = 1
+    return pd.Series(out, index=df.index)
+
+
+def _label_cat2_with_age_interaction(df: pd.DataFrame) -> pd.Series:
+    """home_ownership and gender interact with person_age.
+    Class 1 if RENT & (age<23 OR female); class 0 if OWN or MORTGAGE;
+    class 0 if MORTGAGE & female; class 1 if RENT & male & age<23.
+    Encourages a chain of cat predicates gated by the numerical.
+    """
+    out = np.zeros(len(df), dtype=int)
+    rent = (df["person_home_ownership"] == "RENT")
+    is_female = (df["person_gender"] == "female")
+    young = (df["person_age"] < 23)
+    out[rent & young] = 1
+    out[rent & is_female] = 1
+    return pd.Series(out, index=df.index)
+
+
+def _label_cat2_age_required(df: pd.DataFrame) -> pd.Series:
+    """Class 1 if RENT & (age<23 OR female); else class 0.
+    Same as cat2_with_age_interaction but with the MORTGAGE branch more
+    verbose so the model has to consider more cat predicates.
+    """
+    out = np.zeros(len(df), dtype=int)
+    rent = (df["person_home_ownership"] == "RENT")
+    is_female = (df["person_gender"] == "female")
+    young = (df["person_age"] < 23)
+    out[rent & is_female] = 1
+    out[rent & ~is_female & young] = 1
+    out[(df["person_home_ownership"] == "MORTGAGE") & is_female & young] = 1
+    return pd.Series(out, index=df.index)
+
+
 # -- Default recipe list ----------------------------------------------------
 
 DEFAULT_RECIPES: List[Recipe] = [
@@ -215,6 +261,28 @@ DEFAULT_RECIPES: List[Recipe] = [
         target_col="loan_status",
         label_fn=_label_cat2_num1,
         description="2 categoricals + 1 numerical",
+    ),
+    # -- Rich-chain recipes: encourage multiple linked same-cat preds --
+    Recipe(
+        name="cat2_3way_ownership_gender",
+        feature_cols=["person_gender", "person_home_ownership"],
+        target_col="loan_status",
+        label_fn=_label_cat2_3way,
+        description="2 categoricals (3-way home x gender) -- rich cat chain",
+    ),
+    Recipe(
+        name="cat2_num1_age_interaction",
+        feature_cols=["person_gender", "person_home_ownership", "person_age"],
+        target_col="loan_status",
+        label_fn=_label_cat2_with_age_interaction,
+        description="2 categoricals + 1 numerical with multi-cat interaction",
+    ),
+    Recipe(
+        name="cat2_num1_age_required",
+        feature_cols=["person_gender", "person_home_ownership", "person_age"],
+        target_col="loan_status",
+        label_fn=_label_cat2_age_required,
+        description="2 categoricals + 1 numerical (3-branch rule)",
     ),
 ]
 
