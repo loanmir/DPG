@@ -80,9 +80,9 @@ DEFAULT_DATASETS = [
 ]
 
 # Default hyper-parameter grid
-DEFAULT_PERC_VARS = [0.075, 0.10] # [0.005, 0.01, 0.025, 0.05, 0.075, 0.10]
-DEFAULT_DECIMAL_THRESHOLDS = [2, 3]
-DEFAULT_COMMUNITY_THRESHOLDS = [0.20, 0.30]
+DEFAULT_PERC_VARS = [0.01, 0.075] # [0.005, 0.01, 0.025, 0.05, 0.075, 0.10]
+DEFAULT_DECIMAL_THRESHOLDS = [2, 3] # 1, 2, 3
+DEFAULT_COMMUNITY_THRESHOLDS = [0.20, 0.30] #  0.25, 0.30
 
 # Default for the random search: how many random samples to draw from the
 # candidate ranges. The full grid would produce 13 ds * 6 pv * 3 dt * 3 ct
