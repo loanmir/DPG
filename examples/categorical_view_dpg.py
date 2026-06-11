@@ -120,9 +120,9 @@ def _to_categorical_label(label: str) -> str:
     base, category = split
     # op ``>`` means the dummy is set (1), ``<=`` means it is unset (0).
     if op in (">", ">="):
-        return f"{base} \u2208 {{{category}}}"
+        return f"{base} IN {{{category}}}"
     if op in ("<=", "<"):
-        return f"{base} \u2209 {{{category}}}"
+        return f"{base} NOT IN {{{category}}}"
     return label
 
 

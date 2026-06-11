@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import sys
 from dataclasses import dataclass
@@ -79,9 +80,14 @@ DEFAULT_DATASETS = [
 ]
 
 # Default hyper-parameter grid
-DEFAULT_PERC_VARS = [0.005, 0.01, 0.025, 0.05, 0.075, 0.10]
-DEFAULT_DECIMAL_THRESHOLDS = [1, 2, 3]
-DEFAULT_COMMUNITY_THRESHOLDS = [0.10, 0.20, 0.30]
+DEFAULT_PERC_VARS = [0.075, 0.10] # [0.005, 0.01, 0.025, 0.05, 0.075, 0.10]
+DEFAULT_DECIMAL_THRESHOLDS = [2, 3]
+DEFAULT_COMMUNITY_THRESHOLDS = [0.20, 0.30]
+
+# Default for the random search: how many random samples to draw from the
+# candidate ranges. The full grid would produce 13 ds * 6 pv * 3 dt * 3 ct
+# = 702 runs which is wasteful when many combinations are equivalent.
+DEFAULT_N_RANDOM_SAMPLES = 50
 
 RANDOM_STATE = 27
 NUM_TREES = 10
@@ -98,6 +104,18 @@ def _json_default(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _short_feature_tag(features: Sequence[str]) -> str:
+    """Compact, filename-safe representation of a feature subset.
+
+    Long lists are truncated: ``a_b_c__+5`` means ``a, b, c`` plus 5 more.
+    """
+    cleaned = [str(f).replace(" ", "_").replace(os.sep, "_") for f in features]
+    head = cleaned[:3]
+    extra = len(cleaned) - len(head)
+    base = "_".join(head) if head else "none"
+    return f"{base}__{extra}more" if extra > 0 else base
 
 
 def load_dataset(dataset_name: str):
@@ -183,6 +201,8 @@ class RunResult:
     n_edges: int
     n_communities: int
     out_dir: str
+    n_features_used: int
+    features_used: str  # semicolon-joined list, empty == all features
 
 
 def run_one(
@@ -190,9 +210,15 @@ def run_one(
     perc_var: float,
     decimal_threshold: int,
     community_threshold: float,
+    *,
+    feature_subset_rng: Optional[random.Random] = None,
+    feature_frac_min: float = 0.5,
+    feature_frac_max: float = 1.0,
+    feature_min: int = 1,
 ) -> RunResult:
     # Output directory
     short_ds = dataset_name.replace("toy_", "").replace(".csv", "")
+    # Placeholder; final run_id is built after we know the chosen feature set.
     run_id = (
         f"ds={short_ds}_pv={perc_var}_dt={decimal_threshold}_ct={community_threshold}"
     )
@@ -202,8 +228,31 @@ def run_one(
     # Per-run config.yaml
     cfg_path = write_run_config(out_dir, perc_var, decimal_threshold)
 
-    # Load + train
+    # Load + (optionally) subsample features
     X, y, feature_names, original_feature_names = load_dataset(dataset_name)
+    all_features = list(feature_names)
+    chosen_features: List[str] = all_features
+    if feature_subset_rng is not None and len(all_features) > feature_min:
+        frac_lo = max(0.0, min(1.0, feature_frac_min))
+        frac_hi = max(frac_lo, min(1.0, feature_frac_max))
+        frac = feature_subset_rng.uniform(frac_lo, frac_hi)
+        k = max(feature_min, int(round(frac * len(all_features))))
+        k = min(k, len(all_features))
+        chosen_features = feature_subset_rng.sample(all_features, k=k)
+        # Re-derive the run_id so the chosen feature subset is reflected on disk.
+        short_feats = _short_feature_tag(chosen_features)
+        run_id = (
+            f"ds={short_ds}_pv={perc_var}_dt={decimal_threshold}"
+            f"_ct={community_threshold}_feats={short_feats}"
+        )
+        out_dir = os.path.join(RESULTS_ROOT, run_id)
+        os.makedirs(out_dir, exist_ok=True)
+        cfg_path = write_run_config(out_dir, perc_var, decimal_threshold)
+        X = X[chosen_features]
+        feature_names = chosen_features
+    metric_suffix = f"acc_{round(0, 2)}"  # filled below
+
+    # Train
     model = RandomForestClassifier(n_estimators=NUM_TREES, random_state=RANDOM_STATE)
     acc, f1, (X_train, y_train) = train_cv(model, X, y)
     metric_suffix = f"acc_{round(acc, 2)}"
@@ -245,6 +294,13 @@ def run_one(
             os.path.join(out_dir, f"{run_id}_dpg_communities.txt"),
         )
 
+    # When a feature subset was sampled, dump the chosen features next to the
+    # other artifacts so the run is fully self-describing.
+    if chosen_features and chosen_features != all_features:
+        with open(os.path.join(out_dir, f"{run_id}_features.txt"), "w") as f:
+            for feat in chosen_features:
+                f.write(f"{feat}\n")
+
     # Plots (no blocking show)
     explainer.plot(
         run_id,
@@ -284,6 +340,8 @@ def run_one(
         n_edges=n_edges,
         n_communities=n_comms,
         out_dir=out_dir,
+        n_features_used=len(chosen_features),
+        features_used=";".join(chosen_features) if chosen_features != all_features else "",
     )
 
 
@@ -301,6 +359,58 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--perc-var", default=",".join(map(str, DEFAULT_PERC_VARS)))
     parser.add_argument("--decimal-threshold", default=",".join(map(str, DEFAULT_DECIMAL_THRESHOLDS)))
     parser.add_argument("--community-threshold", default=",".join(map(str, DEFAULT_COMMUNITY_THRESHOLDS)))
+    parser.add_argument(
+        "--mode",
+        choices=("random", "full"),
+        default="random",
+        help=(
+            "Search strategy. 'random' (default) samples N combinations from the "
+            "candidate ranges and is the recommended option; 'full' reproduces the "
+            "original exhaustive grid."
+        ),
+    )
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=DEFAULT_N_RANDOM_SAMPLES,
+        help=(
+            "Number of random hyper-parameter combinations to draw per dataset "
+            "(only used when --mode=random)."
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_STATE,
+        help="Random seed for the random search.",
+    )
+    parser.add_argument(
+        "--random-features",
+        action="store_true",
+        help=(
+            "If set, each run samples a random subset of the dataset's features "
+            "instead of using all of them. The subset size is drawn uniformly "
+            "from [feature-frac-min, feature-frac-max] * n_features."
+        ),
+    )
+    parser.add_argument(
+        "--feature-frac-min",
+        type=float,
+        default=0.5,
+        help="Lower bound (fraction of features) for the random feature subset.",
+    )
+    parser.add_argument(
+        "--feature-frac-max",
+        type=float,
+        default=1.0,
+        help="Upper bound (fraction of features) for the random feature subset.",
+    )
+    parser.add_argument(
+        "--feature-min",
+        type=int,
+        default=1,
+        help="Lower bound (absolute number of features) for the random feature subset.",
+    )
     args = parser.parse_args(argv)
 
     datasets = [s.strip() for s in args.datasets.split(",") if s.strip()]
@@ -310,27 +420,56 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     os.makedirs(RESULTS_ROOT, exist_ok=True)
     print(f"[gridsearch] results root: {RESULTS_ROOT}")
-    print(f"[gridsearch] {len(datasets)} datasets x {len(perc_vars)} perc_var x "
-          f"{len(dec_thr)} decimal_threshold x {len(com_thr)} community_threshold "
-          f"= {len(datasets)*len(perc_vars)*len(dec_thr)*len(com_thr)} runs")
+
+    # Build the list of (pv, dt, ct) combinations according to the chosen mode.
+    rng = random.Random(args.seed)
+    if args.mode == "full":
+        combos: List[tuple] = [(pv, dt, ct) for pv in perc_vars for dt in dec_thr for ct in com_thr]
+        print(
+            f"[gridsearch] mode=full: {len(datasets)} datasets x {len(combos)} combos "
+            f"= {len(datasets) * len(combos)} runs"
+        )
+    else:
+        n_samples = max(1, min(args.n_samples, len(perc_vars) * len(dec_thr) * len(com_thr)))
+        combos = [
+            (rng.choice(perc_vars), rng.choice(dec_thr), rng.choice(com_thr))
+            for _ in range(n_samples)
+        ]
+        print(
+            f"[gridsearch] mode=random (seed={args.seed}): {len(datasets)} datasets x "
+            f"{len(combos)} sampled combos "
+            f"= {len(datasets) * len(combos)} runs"
+        )
 
     results: List[Dict] = []
+    # Independent RNG for feature-subset sampling, derived from the same seed
+    # but a separate stream so that combo selection and feature selection are
+    # reproducible yet uncorrelated.
+    feature_rng = random.Random(args.seed + 1) if args.random_features else None
     for ds in datasets:
-        for pv in perc_vars:
-            for dt in dec_thr:
-                for ct in com_thr:
-                    tag = f"ds={ds.replace('toy_','').replace('.csv','')} pv={pv} dt={dt} ct={ct}"
-                    print(f"\n[run] {tag}")
-                    try:
-                        r = run_one(ds, pv, dt, ct)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  ! FAILED: {exc}")
-                        continue
-                    print(
-                        f"  acc={r.accuracy:.3f}  f1={r.f1:.3f}  "
-                        f"nodes={r.n_nodes}  edges={r.n_edges}  comms={r.n_communities}"
-                    )
-                    results.append(r.__dict__)
+        for pv, dt, ct in combos:
+            tag = f"ds={ds.replace('toy_','').replace('.csv','')} pv={pv} dt={dt} ct={ct}"
+            print(f"\n[run] {tag}")
+            try:
+                r = run_one(
+                    ds,
+                    pv,
+                    dt,
+                    ct,
+                    feature_subset_rng=feature_rng,
+                    feature_frac_min=args.feature_frac_min,
+                    feature_frac_max=args.feature_frac_max,
+                    feature_min=args.feature_min,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ! FAILED: {exc}")
+                continue
+            print(
+                f"  acc={r.accuracy:.3f}  f1={r.f1:.3f}  "
+                f"nodes={r.n_nodes}  edges={r.n_edges}  comms={r.n_communities}  "
+                f"feats={r.n_features_used}"
+            )
+            results.append(r.__dict__)
 
     # Append to the summary CSV (write header only if the file doesn't exist)
     df = pd.DataFrame(results)
@@ -345,7 +484,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             [
                 "dataset", "perc_var", "decimal_threshold",
                 "community_threshold", "accuracy", "f1",
-                "n_nodes", "n_edges", "n_communities", "out_dir",
+                "n_nodes", "n_edges", "n_communities",
+                "n_features_used", "out_dir",
             ]
         ]
         print(show.to_string(index=False))
