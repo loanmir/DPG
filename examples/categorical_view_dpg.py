@@ -423,7 +423,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root",
-        default=os.path.join(SCRIPT_DIR, "results_gridsearch"),
+        default=os.path.join(SCRIPT_DIR, "results_cat"),
         help="Root directory containing one subdirectory per gridsearch run.",
     )
     parser.add_argument(
