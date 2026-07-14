@@ -1,0 +1,61 @@
+person_education,person_income,loan_int_rate,loan_status
+Master,202525.0,10.65,1
+High School,97195.0,8.49,0
+Bachelor,135292.0,11.01,0
+Bachelor,69353.0,11.99,0
+Master,102114.0,15.95,1
+Associate,51747.0,16.35,0
+Master,18367.0,11.14,1
+Bachelor,91541.0,16.32,0
+Associate,117668.0,7.9,0
+Associate,70930.0,11.83,0
+Bachelor,28372.0,5.79,1
+Master,102011.0,13.85,1
+Associate,79098.0,11.99,0
+Associate,41468.0,8.88,0
+High School,115130.0,10.99,0
+High School,82432.0,10.75,0
+Bachelor,204962.0,11.01,0
+Bachelor,208059.0,11.83,0
+Master,124437.0,15.7,1
+High School,144904.0,9.91,0
+Associate,221559.0,11.83,0
+Bachelor,85246.0,9.88,0
+Bachelor,90938.0,10.25,0
+Associate,28367.0,8.94,0
+Bachelor,22466.0,9.96,1
+Master,110953.0,15.33,1
+Associate,24751.0,11.01,0
+Bachelor,158338.0,5.99,0
+High School,241030.0,14.79,0
+High School,210705.0,10.59,0
+Associate,25416.0,15.23,0
+Associate,182316.0,11.11,0
+Bachelor,300951.0,12.98,0
+Master,109089.0,11.49,1
+Master,109061.0,13.57,1
+High School,192351.0,17.27,0
+High School,60841.0,13.11,0
+Associate,27201.0,12.68,0
+High School,88950.0,11.01,0
+Associate,100756.0,10.99,0
+Associate,85496.0,13.98,0
+High School,51305.0,6.99,0
+Bachelor,178439.0,18.3,0
+Bachelor,21790.0,11.36,1
+Associate,91001.0,8.88,0
+Bachelor,331034.0,11.58,0
+Bachelor,205060.0,13.57,0
+Bachelor,333399.0,11.01,0
+High School,193076.0,9.99,0
+Bachelor,205144.0,7.49,0
+Bachelor,71599.0,10.71,0
+Bachelor,311952.0,14.42,0
+Bachelor,94830.0,8.9,0
+Associate,222975.0,11.36,0
+Bachelor,116439.0,15.68,0
+High School,240932.0,8.49,0
+Associate,95767.0,7.9,0
+Associate,95753.0,14.96,0
+Bachelor,15252.0,13.48,1
+Associate,67265.0,6.91,0
