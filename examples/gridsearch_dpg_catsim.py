@@ -10,6 +10,15 @@ categorical feature multiple times along a root-to-leaf path with sets that
 rather than partitioning it (e.g. ``cat_feat NOT IN {X}`` followed by
 ``cat_feat IN {Y}``).
 
+Scope
+-----
+This variant operates **exclusively on the ``toy_chain_*`` datasets** in
+``datasets/dummy_dataset/``. Those are the synthetic CSVs specifically
+engineered to elicit overlapping same-feature categorical chains. The
+curated ``toy_cat*`` list from earlier versions of this script has been
+removed: the chain datasets are the single source of truth and they
+exercise a richer mix of categorical + numerical feature combinations.
+
 It mirrors ``gridsearch_dpg.py`` in every other respect:
 
   * Trains a RandomForest on each candidate dataset,
@@ -18,22 +27,35 @@ It mirrors ``gridsearch_dpg.py`` in every other respect:
     class boundaries, communities, plots and a per-run ``config.yaml``,
   * Appends a summary CSV.
 
-The only structural differences are:
+Chain recipes (7 total)
+-----------------------
+Original 3 (kept verbatim):
+  * ``chain_intent_a_ab``       - 2-step chain on ``loan_intent`` + age gate
+  * ``chain_education_abc``     - 3-step chain on ``person_education`` only
+  * ``chain_intent_with_age``   - 3-step chain on ``loan_intent`` + age +
+                                  gender gates
 
-  1. The default dataset list is a curated subset that produces richer
-     same-feature categorical chains.
-  2. An optional flag (``--generate-chain-datasets``) will additionally
-     synthesize new chain-friendly toy datasets at runtime into
-     ``datasets/dummy_dataset/`` using recipes specifically engineered to
-     elicit overlapping sequential predicates.
-  3. The artifacts are written under ``examples/results_cat/`` instead of
-     ``examples/results_gridsearch/``.
+New 4 (added in this revision):
+  * ``chain_ownership_rent_mortgage_own`` - 3-step chain on
+        ``person_home_ownership`` (``{RENT}`` -> ``{RENT, MORTGAGE}`` ->
+        ``{RENT, MORTGAGE, OWN}``), gated by ``loan_amnt > 15000``.
+  * ``chain_intent_emp_exp``    - 2-step chain on ``loan_intent``
+        (``{VENTURE}`` -> ``{VENTURE, EDUCATION}``), gated by
+        ``person_emp_exp >= 3``.
+  * ``chain_education_emp_exp`` - 3-step chain on ``person_education``
+        (``{Master}`` -> ``{Master, Bachelor}`` ->
+        ``{Master, Bachelor, High School}``), gated by
+        ``person_income < 40000`` and ``loan_int_rate > 12``.
+  * ``chain_gender_intent_income`` - 3-step chain on ``loan_intent``
+        (``{VENTURE}`` -> ``{VENTURE, EDUCATION}`` ->
+        ``{VENTURE, EDUCATION, HOMEIMPROVEMENT}``), gated by
+        ``person_income > 60000`` and ``person_gender == female``.
 
 Usage:
     python examples/gridsearch_dpg_catsim.py
     python examples/gridsearch_dpg_catsim.py --generate-chain-datasets
     python examples/gridsearch_dpg_catsim.py \\
-        --datasets toy_cat1_loan_intent_6val.csv,toy_chain_intent_a_ab.csv \\
+        --datasets toy_chain_intent_a_ab.csv,toy_chain_ownership_rent_mortgage_own.csv \\
         --mode random --n-samples 25
 """
 
@@ -76,31 +98,39 @@ BASE_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
 RESULTS_ROOT = os.path.join(SCRIPT_DIR, "results_cat")
 SUMMARY_PATH = os.path.join(RESULTS_ROOT, "_summary.csv")
 
-# Datasets already on disk that are most likely to yield same-path,
-# overlapping categorical refinements (multi-value categoricals with
-# non-partitioning label rules).
-DEFAULT_DATASETS = [
-    # 5-value categorical (education) -- expect a chain of linked OHE preds.
-    "toy_cat1_education_5val.csv",
-    # 6-value categorical (loan_intent) -- expect a richer chain.
-    "toy_cat1_loan_intent_6val.csv",
-    # Two high-card categoricals (5 + 6) interacting -> chains on BOTH.
-    "toy_cat2_education_intent.csv",
-    # 3-way home_ownership with gender interaction -> home_ownership chain.
-    "toy_cat2_3way_ownership_gender.csv",
-    # 4-value home_ownership with gender + age -> rich chains.
-    "toy_cat2_num1_gender_ownership_age.csv",
-    "toy_cat2_num1_age_required.csv",
-    "toy_cat2_num1_age_interaction.csv",
-]
+# Chain-friendly datasets (must live in DATA_DIR and follow the
+# ``toy_chain_*.csv`` naming convention). When ``--datasets`` is omitted we
+# auto-discover every ``toy_chain_*.csv`` on disk, in sorted order, so newly
+# added chain recipes are picked up automatically.
+DEFAULT_DATASET_PREFIX = "toy_chain_"
 
-# Optional chain-friendly datasets that this script can synthesize at runtime.
-# Their filenames follow the ``toy_chain_<feat>_<shape>.csv`` convention and
-# they are emitted into ``DATA_DIR``.
+
+def discover_chain_datasets(data_dir: str = DATA_DIR,
+                            prefix: str = DEFAULT_DATASET_PREFIX) -> List[str]:
+    """Return the sorted list of ``toy_chain_*.csv`` filenames in ``data_dir``."""
+    if not os.path.isdir(data_dir):
+        return []
+    return sorted(
+        f for f in os.listdir(data_dir)
+        if f.startswith(prefix) and f.lower().endswith(".csv")
+    )
+
+# Chain recipes that this script can synthesize at runtime. Their filenames
+# follow the ``toy_chain_<recipe>.csv`` convention and they are emitted into
+# ``DATA_DIR``. The 7 recipes below cover a mix of:
+#   * pure-categorical chains
+#   * cat chain + single numerical gate
+#   * cat chain + numerical gate + 2nd categorical gate
 CHAIN_RECIPES = [
-    "chain_intent_a_ab",     # IN {A} then IN {A, B} on the same path
-    "chain_education_abc",   # IN {A} then IN {A, B} then IN {A, B, C}
-    "chain_intent_with_age", # chain of cat preds gated by an age numerical
+    # --- Original 3 -------------------------------------------------------
+    "chain_intent_a_ab",       # 2-step chain on loan_intent + age gate
+    "chain_education_abc",     # 3-step chain on person_education only
+    "chain_intent_with_age",   # 3-step chain on loan_intent + age + gender
+    # --- New 4 (this revision) -------------------------------------------
+    "chain_ownership_rent_mortgage_own",  # 3-step on person_home_ownership
+    "chain_intent_emp_exp",     # 2-step on loan_intent + emp_exp gate
+    "chain_education_emp_exp",  # 3-step on person_education + income + rate
+    "chain_gender_intent_income",  # 3-step on loan_intent + income + gender
 ]
 
 # Hyper-parameter grid (kept narrow for quick iteration; widen as needed).
@@ -173,10 +203,88 @@ def _label_chain_intent_with_age(df: pd.DataFrame) -> pd.Series:
     return (venture | (venture & edu & young) | (venture & edu & home & young & female)).astype(int)
 
 
+def _label_chain_ownership_rent_mortgage_own(df: pd.DataFrame) -> pd.Series:
+    """Class 1 iff person_home_ownership == 'RENT'
+                OR (person_home_ownership in {'RENT', 'MORTGAGE'}
+                    AND loan_amnt > 15000)
+                OR (person_home_ownership in {'RENT', 'MORTGAGE', 'OWN'}
+                    AND loan_amnt > 15000).
+    Three same-feature predicates (RENT subset chain) gated by a numerical.
+    The numerical gate must fire on the same path -> it appears as a
+    sibling/refinement node right after the categorical chain.
+    """
+    rent = (df["person_home_ownership"] == "RENT")
+    mort = (df["person_home_ownership"] == "MORTGAGE")
+    own = (df["person_home_ownership"] == "OWN")
+    big_loan = (df["loan_amnt"] > 15000)
+    return (
+        rent | ((rent | mort) & big_loan) | ((rent | mort | own) & big_loan)
+    ).astype(int)
+
+
+def _label_chain_intent_emp_exp(df: pd.DataFrame) -> pd.Series:
+    """Class 1 iff loan_intent == 'VENTURE'
+                OR (loan_intent in {'VENTURE', 'EDUCATION'}
+                    AND person_emp_exp >= 3).
+    Two same-feature predicates gated by a numerical.
+    """
+    venture = (df["loan_intent"] == "VENTURE")
+    edu = (df["loan_intent"] == "EDUCATION")
+    experienced = (df["person_emp_exp"] >= 3)
+    return (venture | (venture & edu & experienced)).astype(int)
+
+
+def _label_chain_education_emp_exp(df: pd.DataFrame) -> pd.Series:
+    """Class 1 iff person_education == 'Master'
+                OR (person_education in {'Master', 'Bachelor'}
+                    AND person_income < 40000)
+                OR (person_education in {'Master', 'Bachelor', 'High School'}
+                    AND person_income < 40000 AND loan_int_rate > 12).
+    Three same-feature predicates gated by one or two numericals.
+    Encourages a long chain of same-cat refinements plus numerical
+    refinements.
+    """
+    master = (df["person_education"] == "Master")
+    bach = (df["person_education"] == "Bachelor")
+    hs = (df["person_education"] == "High School")
+    low_income = (df["person_income"] < 40000)
+    high_rate = (df["loan_int_rate"] > 12)
+    return (
+        master
+        | ((master | bach) & low_income)
+        | ((master | bach | hs) & low_income & high_rate)
+    ).astype(int)
+
+
+def _label_chain_gender_intent_income(df: pd.DataFrame) -> pd.Series:
+    """Class 1 iff loan_intent == 'VENTURE'
+                OR (loan_intent in {'VENTURE', 'EDUCATION'}
+                    AND person_income > 60000)
+                OR (loan_intent in {'VENTURE', 'EDUCATION', 'HOMEIMPROVEMENT'}
+                    AND person_income > 60000
+                    AND person_gender == 'female').
+    Three same-feature predicates gated by a numerical AND a 2nd cat.
+    """
+    venture = (df["loan_intent"] == "VENTURE")
+    edu = (df["loan_intent"] == "EDUCATION")
+    home = (df["loan_intent"] == "HOMEIMPROVEMENT")
+    high_income = (df["person_income"] > 60000)
+    female = (df["person_gender"] == "female")
+    return (
+        venture
+        | ((venture | edu) & high_income)
+        | ((venture | edu | home) & high_income & female)
+    ).astype(int)
+
+
 CHAIN_LABEL_FNS = {
     "chain_intent_a_ab": _label_chain_intent_a_ab,
     "chain_education_abc": _label_chain_education_abc,
     "chain_intent_with_age": _label_chain_intent_with_age,
+    "chain_ownership_rent_mortgage_own": _label_chain_ownership_rent_mortgage_own,
+    "chain_intent_emp_exp": _label_chain_intent_emp_exp,
+    "chain_education_emp_exp": _label_chain_education_emp_exp,
+    "chain_gender_intent_income": _label_chain_gender_intent_income,
 }
 
 # Default feature subsets per chain recipe.
@@ -184,6 +292,10 @@ CHAIN_FEATURES = {
     "chain_intent_a_ab": ["loan_intent", "person_age"],
     "chain_education_abc": ["person_education"],
     "chain_intent_with_age": ["loan_intent", "person_age", "person_gender"],
+    "chain_ownership_rent_mortgage_own": ["person_home_ownership", "loan_amnt"],
+    "chain_intent_emp_exp": ["loan_intent", "person_emp_exp"],
+    "chain_education_emp_exp": ["person_education", "person_income", "loan_int_rate"],
+    "chain_gender_intent_income": ["loan_intent", "person_income", "person_gender"],
 }
 
 
@@ -462,19 +574,27 @@ def run_one(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="DPG gridsearch for chain-style (overlapping) categorical predicates"
+        description=(
+            "DPG gridsearch for chain-style (overlapping) categorical "
+            "predicates. Operates exclusively on the toy_chain_*.csv "
+            "datasets in datasets/dummy_dataset/."
+        )
     )
     parser.add_argument(
         "--datasets",
-        default=",".join(DEFAULT_DATASETS),
-        help="Comma-separated dataset filenames inside datasets/dummy_dataset/.",
+        default=None,
+        help=(
+            "Comma-separated ``toy_chain_*.csv`` filenames inside "
+            "``datasets/dummy_dataset/``. If omitted, every "
+            "``toy_chain_*.csv`` currently on disk is auto-discovered."
+        ),
     )
     parser.add_argument(
         "--generate-chain-datasets",
         action="store_true",
         help=(
-            "If set, synthesize the chain-friendly toy CSVs into "
-            "datasets/dummy_dataset/ before sweeping. Idempotent unless "
+            "If set, synthesize (or refresh) the chain-friendly toy CSVs "
+            "into datasets/dummy_dataset/ before sweeping. Idempotent unless "
             "--force-chain-regen is also given."
         ),
     )
@@ -482,11 +602,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "--force-chain-regen",
         action="store_true",
         help="Force regeneration of chain datasets even if they already exist.",
-    )
-    parser.add_argument(
-        "--include-chain-only",
-        action="store_true",
-        help="Use only the chain-friendly recipes (overrides --datasets).",
     )
     parser.add_argument("--perc-var", default=",".join(map(str, DEFAULT_PERC_VARS)))
     parser.add_argument("--decimal-threshold", default=",".join(map(str, DEFAULT_DECIMAL_THRESHOLDS)))
@@ -522,19 +637,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         generate_chain_datasets(force=args.force_chain_regen)
 
     # --- Resolve dataset list --------------------------------------------
-    if args.include_chain_only:
-        datasets = [f"toy_{r}.csv" for r in CHAIN_RECIPES]
+    # This script is chain-only: any --datasets entry that doesn't follow
+    # the ``toy_chain_*.csv`` convention is filtered out (with a warning).
+    if args.datasets:
+        requested = [s.strip() for s in args.datasets.split(",") if s.strip()]
     else:
-        datasets = [s.strip() for s in args.datasets.split(",") if s.strip()]
+        requested = discover_chain_datasets()
 
-    # If the chain recipes were generated, append them to the default list
-    # unless the user explicitly constrained --datasets.
-    if args.generate_chain_datasets and not args.include_chain_only and "," in args.datasets:
-        chain_files = [f"toy_{r}.csv" for r in CHAIN_RECIPES]
-        # Only add chain recipes that actually exist on disk now.
-        chain_files = [c for c in chain_files if os.path.exists(os.path.join(DATA_DIR, c))]
-        if chain_files:
-            datasets = list(dict.fromkeys(datasets + chain_files))
+    datasets: List[str] = []
+    for name in requested:
+        if not name.startswith(DEFAULT_DATASET_PREFIX):
+            print(
+                f"  ! SKIP: '{name}' does not match the "
+                f"'{DEFAULT_DATASET_PREFIX}*.csv' convention required by "
+                f"this script."
+            )
+            continue
+        datasets.append(_with_csv(name))
+
+    # Deduplicate while preserving order.
+    datasets = list(dict.fromkeys(datasets))
 
     perc_vars = [float(s) for s in args.perc_var.split(",") if s.strip()]
     dec_thr = [int(s) for s in args.decimal_threshold.split(",") if s.strip()]
