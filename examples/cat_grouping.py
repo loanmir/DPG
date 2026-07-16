@@ -35,6 +35,11 @@ of the one-hot-to-IN/NOT-IN rewrite:
    (``Class 0``/``Class 1``, ``person_age <= 25``, ...) **break** the chain
    and prevent grouping across themselves.
 
+For each processed subdirectory the script writes **both** the
+``..._DPG_grouped.png`` image and a ``..._DPG_grouped_structure.json``
+payload (absorbed nodes dropped, edges reweighted) into the ``wip/``
+subdir, so downstream consumers can load the merged graph directly.
+
 Usage
 -----
     python examples/cat_grouping.py
@@ -396,6 +401,84 @@ def _apply_grouping(
 
 
 # ---------------------------------------------------------------------------
+# Grouped structure JSON payload
+# ---------------------------------------------------------------------------
+
+def _build_grouped_structure(
+    structure: dict,
+    grouped_labels: Dict[str, str],
+    grouped_weights: Dict[Tuple[str, str], float],
+    collapsed_ids: Set[str],
+) -> dict:
+    """Rebuild the ``structure`` dict after the IN/NOT-IN rewrite and the
+    sequential grouping pass.
+
+    Nodes whose ids appear in ``collapsed_ids`` are dropped (they have been
+    absorbed by the leader of their merged run). Surviving nodes keep every
+    original field but have their ``label`` replaced by the value in
+    ``grouped_labels``. Edges are taken from ``grouped_weights`` (which
+    already sums the absorbed weights onto the leader's outgoing edge);
+    any edge whose endpoints were absorbed is filtered out. Non-endpoint
+    metadata (e.g. link ``id``) is preserved by looking the link up in
+    the original ``edges``/``links`` list.
+
+    Returns a new dict that mirrors the top-level shape of ``structure``
+    (``nodes`` + ``graph``) and is safe to ``json.dump`` straight to disk.
+    """
+    # --- Surviving nodes (label rewritten) ------------------------------
+    new_nodes: List[dict] = []
+    for node in structure.get("nodes", []):
+        node_id = str(node.get("id", ""))
+        if not node_id or "->" in node_id:
+            continue  # edge pseudo-nodes
+        if node_id in collapsed_ids:
+            continue  # absorbed into leader
+        new_node = dict(node)
+        new_node["label"] = grouped_labels.get(
+            node_id, str(node.get("label", ""))
+        )
+        new_nodes.append(new_node)
+
+    # --- Build a (src, dst) -> original-link template so we keep the
+    # --- edge metadata (id, etc.) of the first raw occurrence of each key.
+    graph_data = structure.get("graph", {})
+    raw_edges = graph_data.get("edges") or graph_data.get("links") or []
+    template_by_key: Dict[Tuple[str, str], dict] = {}
+    for link in raw_edges:
+        key = (str(link.get("source", "")), str(link.get("target", "")))
+        template_by_key.setdefault(key, dict(link))
+
+    # --- Surviving edges with the grouped weights ----------------------
+    new_edges: List[dict] = []
+    for (src, dst), weight in grouped_weights.items():
+        if src in collapsed_ids or dst in collapsed_ids:
+            continue
+        template = template_by_key.get((src, dst), {})
+        new_link = dict(template)
+        new_link["source"] = src
+        new_link["target"] = dst
+        new_link["weight"] = weight
+        new_edges.append(new_link)
+
+    # --- Stitch the new payload together, preserving every other
+    # --- top-level key that the structure may carry -------------------
+    new_structure: dict = dict(structure)
+    new_structure["nodes"] = new_nodes
+    if "graph" in new_structure:
+        new_graph = dict(new_structure["graph"])
+        new_graph["edges"] = new_edges
+        new_graph["links"] = new_edges
+        new_structure["graph"] = new_graph
+    else:
+        # Fall back to the flat layout (edges under the root) so the
+        # output is still self-consistent.
+        new_structure["edges"] = new_edges
+        new_structure["links"] = new_edges
+
+    return new_structure
+
+
+# ---------------------------------------------------------------------------
 # DOT rendering of the (rewritten + grouped) graph
 # ---------------------------------------------------------------------------
 
@@ -601,6 +684,18 @@ def _process_subdir(
 
     out_path = os.path.join(wip_dir, f"{output_name}.png")
     print(f"  [ok]   {run_id} -> {out_path}")
+
+    # Persist the grouped structure as JSON so downstream tooling can
+    # consume the merged graph without re-running the rewrite + grouping
+    # pipeline.
+    grouped_structure = _build_grouped_structure(
+        structure, grouped_labels, grouped_weights, collapsed_ids
+    )
+    grouped_json_path = os.path.join(wip_dir, f"{output_name}_structure.json")
+    with open(grouped_json_path, "w", encoding="utf-8") as fh:
+        json.dump(grouped_structure, fh, indent=2, ensure_ascii=False)
+    print(f"  [ok]   {run_id} -> {grouped_json_path}")
+
     return out_path
 
 
