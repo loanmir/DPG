@@ -184,39 +184,6 @@ def _build_label_map(structure: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
 # Sequential grouping of IN / NOT IN nodes
 # ---------------------------------------------------------------------------
 
-def _root_to_leaf_paths(
-    sources: List[str], succ: Dict[str, List[str]]
-) -> List[List[str]]:
-    """Enumerate every directed root-to-leaf path in the DAG.
-
-    A path ends when the current node has no outgoing successors. Cycles are
-    detected and broken to keep the algorithm total: a node already on the
-    current path is treated as a leaf.
-
-    Returns the list of paths, each path being a list of node ids from root
-    to leaf (inclusive). Leaves are repeated across paths that branch.
-    """
-    paths: List[List[str]] = []
-
-    def walk(node: str, acc: List[str], on_path: Set[str]) -> None:
-        if node in on_path:
-            # cycle: emit current prefix as a closed path
-            paths.append(acc[:])
-            return
-        new_acc = acc + [node]
-        children = succ.get(node, [])
-        if not children:
-            paths.append(new_acc)
-            return
-        new_on_path = on_path | {node}
-        for c in children:
-            walk(c, new_acc, new_on_path)
-
-    for s in sources:
-        walk(s, [], set())
-    return paths
-
-
 def _format_in_label(base: str, op: str, cats: List[str]) -> str:
     """Canonical ``base IN {A, B}`` / ``base NOT IN {A, B}`` rendering with
     stable category order (preserves first-seen, deduped)."""
@@ -229,79 +196,31 @@ def _format_in_label(base: str, op: str, cats: List[str]) -> str:
     return f"{base} {op} {{{', '.join(deduped)}}}"
 
 
-def _collapse_path(
-    path: List[str],
-    label_map: Dict[str, str],
-    weight_map: Dict[Tuple[str, str], float],
-) -> List[Tuple[str, str]]:
-    """Return the list of ``(node_id, label)`` pairs that should appear in
-    the collapsed graph, in path order, after merging consecutive
-    same-base+same-op categorical nodes.
-
-    Edges along a collapsed segment have their weights summed and stored
-    in ``weight_map`` keyed by ``(incoming_node_id, outgoing_node_id)``.
-
-    The first/last nodes of the path are always preserved. A path of length
-    1 (a leaf) yields the single node unchanged.
-    """
-    if len(path) <= 1:
-        return [(path[0], label_map[path[0]])]
-
-    out: List[Tuple[str, str]] = []
-    i = 0
-    n = len(path)
-    while i < n:
-        nid = path[i]
-        cur_label = label_map[nid]
-        cur_parsed = _parse_in_label(cur_label)
-        if cur_parsed is None:
-            # Non-categorical node: emit as-is and move on.
-            out.append((nid, cur_label))
-            i += 1
-            continue
-        base, op, cats = cur_parsed
-        # Greedily extend the run while the next node is IN/NOT IN on the
-        # same base with the same operator.
-        j = i + 1
-        merged_cats: List[str] = list(cats)
-        # Track the sum of edge weights that the merged segment absorbs:
-        # the weight of edge (path[k-1] -> path[k]) for k in (i+1 .. j).
-        absorbed_weight = 0.0
-        while j < n:
-            next_label = label_map[path[j]]
-            next_parsed = _parse_in_label(next_label)
-            if next_parsed is None:
-                break
-            nbase, nop, ncats = next_parsed
-            if nbase != base or nop != op:
-                break
-            merged_cats.extend(ncats)
-            # Absorb the weight of the edge (path[j-1] -> path[j]).
-            absorbed_weight += weight_map.get((path[j - 1], path[j]), 0.0)
-            j += 1
-        # The merged segment is path[i .. j-1]. We collapse it into a
-        # single canonical node keyed by path[i] (so the id is stable and
-        # we don't need to invent new node ids).
-        if j - i == 1:
-            # No neighbours to merge with; emit original.
-            out.append((nid, cur_label))
-        else:
-            out.append((nid, _format_in_label(base, op, merged_cats)))
-            # The outgoing edge weight from the merged node is the sum of
-            # the original consecutive edges. We don't know the final
-            # destination here (it's the next node *after* the segment),
-            # so the caller computes that.
-            # We store a per-segment flag instead.
-            weight_map[("__merge_in__", path[j - 1])] = absorbed_weight
-        i = j
-    return out
-
-
 def _apply_grouping(
     structure: dict,
     label_map: Dict[str, str],
 ) -> Tuple[Dict[str, str], Dict[Tuple[str, str], float], Set[str]]:
-    """Apply the sequential grouping pass.
+    """Apply the sequential grouping pass directly on the graph structure.
+
+    A run of nodes ``n0 -> n1 -> ... -> nk`` collapses into ``n0`` when,
+    for every consecutive pair ``(n_i, n_{i+1})``:
+
+    * both nodes parse as an ``IN``/``NOT IN`` categorical predicate on the
+      *same* base feature and the *same* operator, and
+    * ``n_i`` has exactly one outgoing edge (to ``n_{i+1}``), and
+    * ``n_{i+1}`` has exactly one incoming edge (from ``n_i``).
+
+    These two degree checks are what make the collapse structurally safe:
+    if ``n_i`` had another child, relabelling it to the merged predicate
+    would silently change the meaning of that other branch too; if
+    ``n_{i+1}`` had another parent, dropping it would disconnect that
+    parent's branch. A node that fails either check simply ends the run
+    instead of merging, so a run is always the longest *simple* chain
+    available -- matching the "branching nodes break the chain" rule.
+
+    The run's merged outgoing edge(s) carry every weight the run absorbs:
+    the edges internal to the run *and* the edge(s) leaving the run's tail
+    node to whatever comes next (a Class node or another predicate).
 
     Returns
     -------
@@ -314,16 +233,15 @@ def _apply_grouping(
         non-leading nodes of every merged run). The caller should drop
         these from the rendered graph.
     """
-    # --- Build the directed graph (NetworkX may or may not be available
-    # --- as a hard dep, but the script's project root makes it available).
     graph_data = structure.get("graph", {})
     nx_graph = json_graph.node_link_graph(graph_data)
 
-    succ: Dict[str, List[str]] = {str(n): [str(c) for c in nx_graph.successors(str(n))]
-                                  for n in nx_graph.nodes()}
-    # Root nodes: in-degree 0.
-    indeg: Dict[str, int] = {str(n): nx_graph.in_degree(str(n)) for n in nx_graph.nodes()}
-    sources: List[str] = [n for n, d in indeg.items() if d == 0]
+    succ: Dict[str, List[str]] = {
+        str(n): [str(c) for c in nx_graph.successors(str(n))] for n in nx_graph.nodes()
+    }
+    pred: Dict[str, List[str]] = {
+        str(n): [str(p) for p in nx_graph.predecessors(str(n))] for n in nx_graph.nodes()
+    }
 
     # --- Original edge weights, indexed by (src, dst) -------------------
     raw_edges = graph_data.get("edges", graph_data.get("links", []))
@@ -337,65 +255,67 @@ def _apply_grouping(
             w = 0.0
         weight_map[(src, dst)] = w
 
-    paths = _root_to_leaf_paths(sources, succ)
+    parsed_map: Dict[str, Optional[Tuple[str, str, List[str]]]] = {
+        nid: _parse_in_label(label) for nid, label in label_map.items()
+    }
 
-    # --- Walk each path and collapse runs -------------------------------
-    # Use a *fresh* per-call absorbed-weight map. The ``_collapse_path``
-    # helper stashes intermediate values under a sentinel key
-    # ``("__merge_in__", last_id_of_segment)`` -- we resolve them here by
-    # re-walking the collapsed path.
-    collapsed_ids: Set[str] = set()
-    grouped_labels: Dict[str, str] = dict(label_map)  # shallow copy
+    def _mergeable(u: str, v: str) -> bool:
+        pu, pv = parsed_map.get(u), parsed_map.get(v)
+        if pu is None or pv is None:
+            return False
+        if len(succ.get(u, [])) != 1 or succ[u][0] != v:
+            return False
+        if len(pred.get(v, [])) != 1 or pred[v][0] != u:
+            return False
+        return pu[0] == pv[0] and pu[1] == pv[1]
+
+    # A node is absorbed iff its single predecessor is mergeable with it.
+    # Every node that never shows up as a value here is the head of its own
+    # (possibly length-1) run.
+    absorbed_by: Dict[str, str] = {}
+    for u in succ:
+        if len(succ.get(u, [])) == 1:
+            v = succ[u][0]
+            if _mergeable(u, v):
+                absorbed_by[v] = u
+    collapsed_ids: Set[str] = set(absorbed_by.keys())
+
+    grouped_labels: Dict[str, str] = dict(label_map)
     grouped_weights: Dict[Tuple[str, str], float] = dict(weight_map)
 
-    for path in paths:
-        # Build a clean per-path collapse to know which nodes are merged
-        # into their leader. A node at index k (k > 0) of the merged
-        # run is "absorbed" if its label was rewritten in this pass.
-        i = 0
-        n = len(path)
-        while i < n:
-            nid = path[i]
-            cur_label = label_map[nid]
-            cur_parsed = _parse_in_label(cur_label)
-            if cur_parsed is None:
-                i += 1
-                continue
-            base, op, cats = cur_parsed
-            j = i + 1
-            merged_cats: List[str] = list(cats)
-            while j < n:
-                nxt_label = label_map[path[j]]
-                nxt_parsed = _parse_in_label(nxt_label)
-                if nxt_parsed is None:
-                    break
-                nbase, nop, ncats = nxt_parsed
-                if nbase != base or nop != op:
-                    break
-                merged_cats.extend(ncats)
-                j += 1
-            if j - i > 1:
-                # Collapse path[i .. j-1] into path[i].
-                grouped_labels[nid] = _format_in_label(base, op, merged_cats)
-                # Drop the edges INSIDE the segment AND the outgoing edge
-                # of the last absorbed node (it gets replaced by the
-                # leader's outgoing edge with the summed weight).
-                for k in range(i, j - 1):
-                    grouped_weights.pop((path[k], path[k + 1]), None)
-                grouped_weights.pop((path[j - 1], path[j]), None)
-                # Sum the absorbed edge weights onto the OUTGOING edge
-                # of the merged node (i.e. (path[i], path[j])). This
-                # holds whether path[j] is an internal node or a leaf.
-                absorbed = sum(
-                    weight_map.get((path[k], path[k + 1]), 0.0)
-                    for k in range(i, j - 1)
-                )
-                key = (path[i], path[j])
-                grouped_weights[key] = grouped_weights.get(key, 0.0) + absorbed
-                # Mark the absorbed nodes.
-                for k in range(i + 1, j):
-                    collapsed_ids.add(path[k])
-            i = j
+    heads = [
+        n for n in succ
+        if n not in collapsed_ids and parsed_map.get(n) is not None
+    ]
+    for head in heads:
+        run = [head]
+        node = head
+        while len(succ.get(node, [])) == 1 and _mergeable(node, succ[node][0]):
+            node = succ[node][0]
+            run.append(node)
+        if len(run) <= 1:
+            continue
+
+        base, op, _ = parsed_map[head]
+        merged_cats: List[str] = []
+        for nid in run:
+            merged_cats.extend(parsed_map[nid][2])
+        grouped_labels[head] = _format_in_label(base, op, merged_cats)
+
+        internal_sum = sum(
+            weight_map.get((run[k], run[k + 1]), 0.0) for k in range(len(run) - 1)
+        )
+        for k in range(len(run) - 1):
+            grouped_weights.pop((run[k], run[k + 1]), None)
+
+        tail = run[-1]
+        for nxt in succ.get(tail, []):
+            key = (tail, nxt)
+            original = grouped_weights.pop(key, weight_map.get(key, 0.0))
+            new_key = (head, nxt)
+            grouped_weights[new_key] = (
+                grouped_weights.get(new_key, 0.0) + original + internal_sum
+            )
 
     return grouped_labels, grouped_weights, collapsed_ids
 
