@@ -268,9 +268,14 @@ def plot_dpg(
     max_edge_value = df_edges['Weight'].max()
     min_edge_value = df_edges['Weight'].min()
     norm_edge = mcolors.Normalize(vmin=min_edge_value, vmax=max_edge_value)
+    # Weight still modulates shade/thickness, but every edge is floored to at
+    # least this shade so the lightest-weight edge doesn't fade to near-white
+    # and become illegible against the background.
+    min_edge_shade = 0.55
     for index, row in df_edges.iterrows():
         edge_value = row['Weight']
-        color = colormap_edge(norm_edge(edge_value))
+        shade = min_edge_shade + (1 - min_edge_shade) * norm_edge(edge_value)
+        color = colormap_edge(shade)
         color_hex = "#{:02x}{:02x}{:02x}".format(int(color[0]*255),
                                                     int(color[1]*255),
                                                     int(color[2]*255))
