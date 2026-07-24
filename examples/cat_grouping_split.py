@@ -44,9 +44,10 @@ grouping every eligible chain instead of only the (rare) fully private ones.
 
 For each processed subdirectory the script writes both the
 ``..._DPG_split_grouped.png`` image and a
-``..._DPG_split_grouped_structure.json`` payload into the ``wip/`` subdir,
-alongside (not overwriting) whatever ``cat_grouping.py`` already produced
-there.
+``..._DPG_split_grouped_structure.json`` payload into the
+``wip/grouping_split/`` subdir, so it never overwrites whatever
+``cat_grouping.py`` (or anything else) already produced directly in
+``wip/``.
 
 Usage
 -----
@@ -417,7 +418,7 @@ def main() -> int:
         f"(amount={args.amount if args.amount is not None else 'all'})."
     )
     for subdir in subdirs:
-        wip_dir = os.path.join(subdir, "wip")
+        wip_dir = os.path.join(subdir, "wip", "grouping_split")
         try:
             _process_subdir(subdir, wip_dir, visualization_config)
         except Exception as exc:  # pragma: no cover - best-effort reporting
