@@ -9,6 +9,7 @@ This script demonstrates a complete workflow for:
 import sys
 import os
 import json
+import re
 
 SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -16,10 +17,12 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import pandas as pd
 import numpy as np
+import networkx as nx
 from networkx.readwrite import json_graph
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import KFold
+from sklearn.preprocessing import OrdinalEncoder
 from dpg import DPGExplainer
 import yaml
 
@@ -34,23 +37,81 @@ def load_config(config_path):
         raise yaml.YAMLError(f"Invalid YAML in config file: {str(e)}")
 
 
-def load_dataset(dataset_name, base_dir):
-    # Load CSV dataset from datasets/ and split features/labels
-    dataset_path = os.path.join(base_dir, "datasets/dummy_dataset", dataset_name)
+def load_dataset(dataset_name, base_dir, categorical_encoding="onehot", target_column=None):
+    # Load CSV dataset from datasets/ and split features/labels.
+    # target_column lets callers point at the real label column explicitly -
+    # not every dataset puts it last (e.g. german_credit has it first).
+    dataset_path = os.path.join(base_dir, "datasets/credit_card_approval", dataset_name)
     dataset_raw = pd.read_csv(dataset_path)
 
-    features = dataset_raw.iloc[:, :-1]
-    target_column = dataset_raw.columns[-1]
-    feature_names = dataset_raw.columns[:-1]
+    if target_column is None:
+        target_column = dataset_raw.columns[-1]
+
+    features = dataset_raw.drop(columns=[target_column]).copy()
     labels = dataset_raw[target_column]
 
-    # Capture original feature names before one-hot encoding (so the rest of the
+    # Capture original feature names before encoding (so the rest of the
     # pipeline still sees the original column names, e.g. for plots / DPG metrics).
     original_feature_names = list(features.columns)
 
-    # One-hot encode categorical (object/string) columns so they survive downstream
+    categorical_cols = [
+        col
+        for col in features.columns
+        if features[col].dtype == "object" or features[col].dtype.name == "category"
+    ]
+    bool_cols = [col for col in features.columns if features[col].dtype == "bool"]
+
+    # Encode categorical (object/string/bool) columns so they survive downstream
     # numeric operations like .mean() / .fillna(). Numeric columns are passed through.
-    features = pd.get_dummies(features, drop_first=False)
+    # feature_origin_map traces each post-encoding column back to the original
+    # column it came from - needed to compare/aggregate explanations across
+    # encodings that expand columns differently (e.g. one-hot).
+    if categorical_encoding == "onehot":
+        # Encode column-by-column (instead of one bulk pd.get_dummies call) so
+        # we know exactly which original column produced each dummy column.
+        encoded_parts = []
+        feature_origin_map = {}
+        for col in features.columns:
+            if col in categorical_cols:
+                dummies = pd.get_dummies(features[[col]], drop_first=False)
+                for dcol in dummies.columns:
+                    feature_origin_map[dcol] = col
+                encoded_parts.append(dummies)
+            else:
+                feature_origin_map[col] = col
+                encoded_parts.append(features[[col]])
+        features = pd.concat(encoded_parts, axis=1)
+    elif categorical_encoding == "ordinal":
+        # Integer codes assigned per unique category value (alphabetical by
+        # default), i.e. sklearn's OrdinalEncoder. Codes carry no inherent
+        # magnitude/order relative to the original categories unless the
+        # column happens to already be alphabetically ordered by meaning.
+        if categorical_cols:
+            features[categorical_cols] = OrdinalEncoder(dtype=np.float64).fit_transform(
+                features[categorical_cols].astype(str)
+            )
+        for col in bool_cols:
+            features[col] = features[col].astype(int)
+        feature_origin_map = {col: col for col in features.columns}
+    elif categorical_encoding == "target":
+        # Mean/"target-like" encoding: each category is replaced by the mean
+        # of the (numeric-coded) target among rows with that category.
+        # Computed on the full dataset before the CV split in
+        # train_model_cv, so this leaks target information across folds -
+        # acceptable for this exploratory quickstart, not for a real model.
+        target_numeric, _ = pd.factorize(labels)
+        target_numeric = pd.Series(target_numeric, index=features.index)
+        for col in categorical_cols:
+            category_means = target_numeric.groupby(features[col]).mean()
+            features[col] = features[col].map(category_means).astype(float)
+        for col in bool_cols:
+            features[col] = features[col].astype(int)
+        feature_origin_map = {col: col for col in features.columns}
+    else:
+        raise ValueError(
+            f"Unknown categorical_encoding '{categorical_encoding}', "
+            "expected 'onehot', 'ordinal', or 'target'"
+        )
 
     # Clean data: handle infinities and missing values
     features = features.replace([np.inf, -np.inf], np.nan).fillna(features.mean())
@@ -61,7 +122,7 @@ def load_dataset(dataset_name, base_dir):
     feature_names = list(features_matrix.columns)
 
     print("Size of X", features_matrix.shape)
-    return features_matrix, labels, feature_names, original_feature_names
+    return features_matrix, labels, feature_names, original_feature_names, feature_origin_map
 
 
 def train_model_cv(model, features_matrix, labels, random_state):
@@ -88,7 +149,89 @@ def train_model_cv(model, features_matrix, labels, random_state):
 
     mean_accuracy = np.mean(accuracy_scores)
     metric_suffix = f"acc_{np.round(mean_accuracy, 2)}"
-    return metric_suffix, last_train
+    return metric_suffix, last_train, float(mean_accuracy)
+
+
+##### LUCAS JAKIN
+def extract_predicate_columns(explanation, feature_origin_map):
+    """Return (encoded_column, original_column) for every predicate (split)
+    node in the DPG graph - class/leaf nodes are skipped. Mirrors the same
+    ' <= '/' > ' split used by GraphMetrics.calculate_class_boundaries."""
+    pairs = []
+    for label in explanation.node_metrics["Label"]:
+        parts = re.split(' <= | > ', str(label))
+        if len(parts) != 2:
+            continue
+        encoded_col = parts[0].strip()
+        pairs.append((encoded_col, feature_origin_map.get(encoded_col, encoded_col)))
+    return pairs
+
+
+##### LUCAS JAKIN
+def compute_clarity_metrics(explanation, feature_origin_map):
+    """Heuristic 'semantic clarity' numbers for a DPG graph:
+    - how fragmented the original features are across predicate nodes
+      (one-hot splits a single original feature into many nodes)
+    - what fraction of predicates are self-explanatory from their column
+      name alone (true for one-hot dummy columns, e.g.
+      "gender_female <= 0.5"; false for ordinal/target codes where the
+      split value needs an external lookup table to mean anything).
+    """
+    pairs = extract_predicate_columns(explanation, feature_origin_map)
+    total = len(pairs)
+    original_features = {orig for _, orig in pairs}
+    self_explanatory = sum(1 for enc, orig in pairs if enc != orig)
+    return {
+        "num_predicate_nodes": total,
+        "num_original_features_referenced": len(original_features),
+        "avg_predicate_nodes_per_feature": (
+            total / len(original_features) if original_features else float("nan")
+        ),
+        "pct_self_explanatory_predicates": (
+            self_explanatory / total if total else float("nan")
+        ),
+    }
+
+
+##### LUCAS JAKIN
+def compute_graph_depth(explanation):
+    # Longest root-to-leaf predicate chain; only well-defined if the merged
+    # graph is acyclic (predicate nodes shared across trees with differing
+    # split order can in principle create cycles).
+    graph = explanation.graph
+    if nx.is_directed_acyclic_graph(graph):
+        # weight=None: count hops, don't sum the edges' path-occurrence
+        # "weight" attribute (dag_longest_path_length sums it by default).
+        return nx.dag_longest_path_length(graph, weight=None)
+    return float("nan")
+
+
+##### LUCAS JAKIN
+def node_label_set(explanation):
+    return set(explanation.node_metrics["Label"].astype(str))
+
+
+##### LUCAS JAKIN
+def edge_pair_set(explanation):
+    return set(
+        zip(
+            explanation.edge_metrics["Node_u_label"].astype(str),
+            explanation.edge_metrics["Node_v_label"].astype(str),
+        )
+    )
+
+
+##### LUCAS JAKIN
+def original_feature_set(explanation, feature_origin_map):
+    return {orig for _, orig in extract_predicate_columns(explanation, feature_origin_map)}
+
+
+##### LUCAS JAKIN
+def jaccard(set_a, set_b):
+    union = set_a | set_b
+    if not union:
+        return float("nan")
+    return len(set_a & set_b) / len(union)
 
 
 ##### LUCAS JAKIN
@@ -121,47 +264,38 @@ def save_dpg_structure_json(explanation, output_path, run_id, feature_names, tar
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
 
-def main():
-    # =============================================================================
-    # CONFIGURATION SECTION
-    # =============================================================================
-    # Tutorial note: adjust these values to point at your dataset and control the run.
-    config = {
-        "dataset_name": "dummy_dataset.csv",
-        "num_trees": 10,
-        "run_tag": "CustomDPG",
-        "random_state": 27,
-        "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
-        "results_dir": os.path.join(SCRIPT_DIR, "results_dummy"),
-    }
+##### LUCAS JAKIN
+def run_single_encoding(base_dir, base_config, config_data, categorical_encoding):
+    """Run the full train + DPG-explain + save pipeline for one categorical
+    encoding, writing outputs under base_config['results_dir']/<encoding>/.
+    Returns a summary dict used to compare encodings afterward.
+    """
+    config = dict(base_config)
+    config["categorical_encoding"] = categorical_encoding
+    config["results_dir"] = os.path.join(base_config["results_dir"], categorical_encoding)
 
-    # Load DPG defaults from config.yaml
-    config_data = load_config(config["config_path"])
     perc_var = config_data["dpg"]["default"]["perc_var"]
 
-    base_dir = PROJECT_ROOT
-    # Load and clean the dataset
-    features_matrix, labels, feature_names, original_feature_names = load_dataset(
-        config["dataset_name"], base_dir
+    features_matrix, labels, feature_names, original_feature_names, feature_origin_map = load_dataset(
+        config["dataset_name"], base_dir, categorical_encoding=categorical_encoding,
+        target_column=config["target_column"],
     )
 
-    # Train a Random Forest and estimate performance via CV
     model = RandomForestClassifier(
         n_estimators=config["num_trees"], random_state=config["random_state"]
     )
 
-    metric_suffix, last_train = train_model_cv(
+    metric_suffix, last_train, mean_accuracy = train_model_cv(
         model, features_matrix, labels, random_state=42
     )
     X_train, y_train = last_train
 
-    # Compose a shared run id for all outputs
     run_id = (
         f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
         f"_bl{config['num_trees']}_{metric_suffix}_perc_{perc_var}"
+        f"_enc{categorical_encoding}"
     )
 
-    # Build and explain DPG via the high-level API
     target_names = np.unique(labels).astype(str).tolist()
     explainer = DPGExplainer(
         model=model,
@@ -176,10 +310,8 @@ def main():
         community_threshold=0.2,
     )
 
-
-    ##### LUCAS JAKIN
-
     os.makedirs(config["results_dir"], exist_ok=True)
+
     dpg_structure_path = os.path.join(
         config["results_dir"], f"{run_id}_dpg_structure.json"
     )
@@ -190,9 +322,6 @@ def main():
         feature_names=feature_names,
         target_names=target_names,
     )
-    
-    ##### LUCAS JAKIN
-
 
     # Save class boundary summary
     class_boundaries_path = os.path.join(
@@ -238,6 +367,186 @@ def main():
         class_flag=True,
         export_pdf=True,
     )
+
+    clarity_metrics = compute_clarity_metrics(explanation, feature_origin_map)
+
+    return {
+        "categorical_encoding": categorical_encoding,
+        "cv_accuracy": mean_accuracy,
+        "cv_accuracy_suffix": metric_suffix,
+        "num_original_features": len(original_feature_names),
+        "num_encoded_features": len(feature_names),
+        "num_dpg_nodes": len(explanation.node_metrics),
+        "num_dpg_edges": len(explanation.edge_metrics),
+        "graph_depth": compute_graph_depth(explanation),
+        **clarity_metrics,
+        # Not written to the scalar comparison CSV - kept for the
+        # cross-encoding agreement comparison in main().
+        "_node_labels": node_label_set(explanation),
+        "_edge_pairs": edge_pair_set(explanation),
+        "_original_features_in_graph": original_feature_set(explanation, feature_origin_map),
+    }
+
+
+##### LUCAS JAKIN
+def run_seed_stability_sweep(base_dir, base_config, config_data, categorical_encoding, seeds):
+    """Rebuild the RF + DPG explanation across multiple random seeds (same
+    seed drives both the RF and the CV split) without saving/plotting, then
+    measure how much the graph's predicate structure changes run to run.
+    Higher mean Jaccard = more stable explanation across seeds.
+    """
+    runs = []
+    for seed in seeds:
+        features_matrix, labels, feature_names, _original_feature_names, feature_origin_map = load_dataset(
+            base_config["dataset_name"], base_dir, categorical_encoding=categorical_encoding,
+            target_column=base_config["target_column"],
+        )
+
+        model = RandomForestClassifier(n_estimators=base_config["num_trees"], random_state=seed)
+        _metric_suffix, last_train, mean_accuracy = train_model_cv(
+            model, features_matrix, labels, random_state=seed
+        )
+        X_train, _y_train = last_train
+
+        target_names = np.unique(labels).astype(str).tolist()
+        explainer = DPGExplainer(
+            model=model,
+            feature_names=feature_names,
+            target_names=target_names,
+            config_file=base_config["config_path"],
+        )
+        try:
+            explanation = explainer.explain_global(X_train.values, communities=False)
+        except Exception as err:
+            # Some seeds can produce a tree ensemble with no path frequent
+            # enough to clear perc_var - skip that seed rather than losing
+            # the whole sweep, since we only need >=2 successful runs to
+            # compute pairwise stability.
+            print(f"WARNING: seed={seed} failed to build a DPG ({err}); skipping it")
+            continue
+
+        runs.append({
+            "seed": seed,
+            "cv_accuracy": mean_accuracy,
+            "node_labels": node_label_set(explanation),
+            "edge_pairs": edge_pair_set(explanation),
+            "original_features": original_feature_set(explanation, feature_origin_map),
+        })
+
+    exact_label_jaccards, edge_jaccards, feature_jaccards = [], [], []
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs)):
+            exact_label_jaccards.append(jaccard(runs[i]["node_labels"], runs[j]["node_labels"]))
+            edge_jaccards.append(jaccard(runs[i]["edge_pairs"], runs[j]["edge_pairs"]))
+            feature_jaccards.append(jaccard(runs[i]["original_features"], runs[j]["original_features"]))
+
+    return {
+        "categorical_encoding": categorical_encoding,
+        "num_seeds_requested": len(seeds),
+        "num_seeds_succeeded": len(runs),
+        "mean_cv_accuracy": float(np.mean([r["cv_accuracy"] for r in runs])) if runs else float("nan"),
+        "std_cv_accuracy": float(np.std([r["cv_accuracy"] for r in runs])) if runs else float("nan"),
+        # Exact-label Jaccard: did the identical predicate string reappear
+        # across seeds (strictest - sensitive to tiny threshold shifts).
+        "mean_exact_label_jaccard": float(np.nanmean(exact_label_jaccards)),
+        # Edge Jaccard: did the same predicate-to-predicate connections reappear.
+        "mean_edge_jaccard": float(np.nanmean(edge_jaccards)),
+        # Feature Jaccard: did the graph keep splitting on the same original
+        # features, regardless of exact threshold (coarsest, most forgiving).
+        "mean_feature_jaccard": float(np.nanmean(feature_jaccards)),
+    }
+
+
+##### LUCAS JAKIN
+def main():
+    # =============================================================================
+    # CONFIGURATION SECTION
+    # =============================================================================
+    # Tutorial note: adjust these values to point at your dataset and control the run.
+    config = {
+        "dataset_name": "loan_data.csv",
+        "target_column": "loan_status",
+        "num_trees": 10,
+        "run_tag": "CustomDPG",
+        "random_state": 27,
+        "config_path": os.path.join(PROJECT_ROOT, "config.yaml"),
+        "results_dir": os.path.join(SCRIPT_DIR, "results_workPackage5"),
+        # Encodings to compare. Each runs the full RF + DPG pipeline and is
+        # written to its own results_dir/<encoding>/ subfolder.
+        "categorical_encodings": ["onehot", "ordinal", "target"],
+        # Seeds used to check how stable each encoding's DPG graph is across
+        # independent train/CV runs (same dataset, different randomness).
+        "stability_seeds": [27, 42, 123, 7, 99],
+        # Two encodings are only compared for graph agreement if their mean
+        # CV accuracy is within this tolerance of each other - otherwise a
+        # low overlap could just mean "one model is worse", not "the
+        # explanations disagree".
+        "agreement_accuracy_tolerance": 0.05,
+    }
+
+    # Load DPG defaults from config.yaml
+    config_data = load_config(config["config_path"])
+    base_dir = PROJECT_ROOT
+
+    ##### LUCAS JAKIN
+    # --- Full pipeline per encoding: train, build DPG, save + plot ---
+    results = []
+    for encoding in config["categorical_encodings"]:
+        print(f"\n=== Running pipeline with categorical_encoding={encoding} ===")
+        results.append(run_single_encoding(base_dir, config, config_data, encoding))
+
+    os.makedirs(config["results_dir"], exist_ok=True)
+    set_fields = {"_node_labels", "_edge_pairs", "_original_features_in_graph"}
+    comparison_rows = [
+        {k: v for k, v in r.items() if k not in set_fields} for r in results
+    ]
+    comparison_path = os.path.join(config["results_dir"], "encoding_comparison.csv")
+    pd.DataFrame(comparison_rows).to_csv(comparison_path, index=False)
+    print(f"\nSaved encoding comparison summary to {comparison_path}")
+
+    # --- Stability across seeds, per encoding ---
+    stability_rows = []
+    for encoding in config["categorical_encodings"]:
+        print(f"\n=== Seed-stability sweep for categorical_encoding={encoding} ===")
+        stability_rows.append(
+            run_seed_stability_sweep(
+                base_dir, config, config_data, encoding, config["stability_seeds"]
+            )
+        )
+    stability_path = os.path.join(config["results_dir"], "encoding_stability.csv")
+    pd.DataFrame(stability_rows).to_csv(stability_path, index=False)
+    print(f"Saved seed-stability summary to {stability_path}")
+
+    # --- Agreement between explanations under similar predictive performance ---
+    agreement_rows = []
+    tolerance = config["agreement_accuracy_tolerance"]
+    for i in range(len(results)):
+        for j in range(i + 1, len(results)):
+            a, b = results[i], results[j]
+            if abs(a["cv_accuracy"] - b["cv_accuracy"]) <= tolerance:
+                agreement_rows.append({
+                    "encoding_a": a["categorical_encoding"],
+                    "encoding_b": b["categorical_encoding"],
+                    "accuracy_a": a["cv_accuracy"],
+                    "accuracy_b": b["cv_accuracy"],
+                    # Compared at the level of original (pre-encoding)
+                    # features, since raw predicate label strings aren't
+                    # comparable across different encodings.
+                    "feature_jaccard": jaccard(
+                        a["_original_features_in_graph"], b["_original_features_in_graph"]
+                    ),
+                })
+
+    agreement_path = os.path.join(config["results_dir"], "encoding_agreement.csv")
+    if agreement_rows:
+        pd.DataFrame(agreement_rows).to_csv(agreement_path, index=False)
+        print(f"Saved cross-encoding agreement summary to {agreement_path}")
+    else:
+        print(
+            f"No encoding pairs within accuracy tolerance {tolerance}; "
+            f"skipped {agreement_path}"
+        )
+    ##### LUCAS JAKIN
 
 
 if __name__ == "__main__":
