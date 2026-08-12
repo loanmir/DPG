@@ -130,6 +130,7 @@ def train_model_cv(model, features_matrix, labels, random_state):
     kf = KFold(n_splits=5, shuffle=True, random_state=random_state)
     accuracy_scores, f1_scores = [], []
     last_train = None
+    last_test = None
 
     for train_index, test_index in kf.split(features_matrix):
         X_train, X_test = features_matrix.iloc[train_index], features_matrix.iloc[test_index]
@@ -144,12 +145,15 @@ def train_model_cv(model, features_matrix, labels, random_state):
         accuracy_scores.append(accuracy)
         f1_scores.append(f1)
         last_train = (X_train, y_train)
+        # Kept so callers can measure fidelity on data the DPG never saw
+        # (it's only ever built from last_train).
+        last_test = (X_test, y_test)
 
         print(f"Fold - Accuracy: {accuracy}, F1-Score: {f1}")
 
     mean_accuracy = np.mean(accuracy_scores)
     metric_suffix = f"acc_{np.round(mean_accuracy, 2)}"
-    return metric_suffix, last_train, float(mean_accuracy)
+    return metric_suffix, last_train, last_test, float(mean_accuracy)
 
 
 ##### LUCAS JAKIN
@@ -235,6 +239,132 @@ def jaccard(set_a, set_b):
 
 
 ##### LUCAS JAKIN
+def parse_predicate_label(label):
+    """Split a DPG node label into (feature, operator, threshold).
+    Returns None for class/leaf nodes (e.g. "Class 0"), which have no
+    ' <= '/' > ' predicate to parse. Node labels are single, literal
+    conditions (see dpg/core.py tracing_ensemble: "feature <= threshold"
+    for the left/true branch, "feature > threshold" for the right/false
+    branch) - so unlike a normal tree node, there is no hidden direction
+    to resolve: the label alone says exactly what must hold.
+    """
+    label = str(label)
+    if ' <= ' in label:
+        feature, threshold = label.split(' <= ', 1)
+        operator = '<='
+    elif ' > ' in label:
+        feature, threshold = label.split(' > ', 1)
+        operator = '>'
+    else:
+        return None
+    try:
+        threshold = float(threshold.strip())
+    except ValueError:
+        return None
+    return feature.strip(), operator, threshold
+
+
+##### LUCAS JAKIN
+def node_holds_for_sample(label, sample_row):
+    """True/False if `sample_row` satisfies this predicate node's condition,
+    or None if the node is a class/leaf node or references a feature not
+    present in sample_row."""
+    parsed = parse_predicate_label(label)
+    if parsed is None:
+        return None
+    feature, operator, threshold = parsed
+    if feature not in sample_row.index:
+        return None
+    value = sample_row[feature]
+    if operator == '<=':
+        return bool(value <= threshold)
+    return bool(value > threshold)
+
+
+##### LUCAS JAKIN
+def predict_with_dpg(explanation, sample_row):
+    """Predict a class for one sample by walking the DPG graph itself,
+    instead of asking the Random Forest.
+
+    Starts only from nodes with in-degree 0 (the closest thing this
+    merged, root-less graph has to "first predicate tested") whose
+    condition the sample satisfies, then keeps following an edge only
+    while the sample also satisfies the next node's condition, until a
+    class node is reached. A per-path visited-set prevents infinite loops
+    on the cycles this graph can contain. If several distinct paths reach
+    different classes, the one backed by the larger total edge weight
+    (i.e. supported by more of the original training paths) wins.
+
+    Returns the predicted class as a string, or None if no path in the
+    (pruned) graph matches this sample at all - the "coverage" gap that
+    perc_var pruning can create. Because in-degree 0 can only under-count
+    true start nodes (a node can end up with incoming edges just by also
+    appearing mid-path in some other tree), this is a conservative, never
+    over-optimistic, estimate of what the graph can predict.
+    """
+    graph = explanation.graph
+    label_by_id = dict(explanation.nodes)
+
+    class_weights = {}
+    for node_id, label in explanation.nodes:
+        label = str(label)
+        if label.startswith("Class "):
+            continue  # a class node can't be a starting predicate
+        if graph.in_degree(node_id) != 0:
+            continue  # only root-like nodes count as valid starts
+        if node_holds_for_sample(label, sample_row) is not True:
+            continue
+
+        stack = [(node_id, frozenset([node_id]))]
+        while stack:
+            current_id, visited = stack.pop()
+            for _, next_id, edge_data in graph.out_edges(current_id, data=True):
+                if next_id in visited:
+                    continue
+                next_label = str(label_by_id.get(next_id, ""))
+                weight = float(edge_data.get("weight", 1.0))
+                if next_label.startswith("Class "):
+                    class_name = next_label[len("Class "):]
+                    class_weights[class_name] = class_weights.get(class_name, 0.0) + weight
+                elif node_holds_for_sample(next_label, sample_row) is True:
+                    stack.append((next_id, visited | {next_id}))
+
+    if not class_weights:
+        return None
+    return max(class_weights, key=class_weights.get)
+
+
+##### LUCAS JAKIN
+def compute_fidelity(explanation, model, X_test):
+    """How often the DPG graph's own prediction agrees with the Random
+    Forest's prediction, on held-out data the graph never saw.
+
+    Reported as two separate numbers rather than one blended score:
+    - fidelity_coverage: fraction of test samples the graph could
+      classify at all (a heavily pruned graph can have low coverage
+      without that meaning its covered predictions are wrong).
+    - fidelity: agreement rate with the Random Forest, among covered
+      samples only.
+    """
+    model_preds = [str(p) for p in model.predict(X_test)]
+    dpg_preds = [predict_with_dpg(explanation, X_test.iloc[i]) for i in range(len(X_test))]
+
+    covered = [i for i, p in enumerate(dpg_preds) if p is not None]
+    coverage = len(covered) / len(dpg_preds) if dpg_preds else float("nan")
+    if covered:
+        agreements = sum(1 for i in covered if dpg_preds[i] == model_preds[i])
+        fidelity = agreements / len(covered)
+    else:
+        fidelity = float("nan")
+
+    return {
+        "fidelity": fidelity,
+        "fidelity_coverage": coverage,
+        "fidelity_n_test": len(dpg_preds),
+    }
+
+
+##### LUCAS JAKIN
 def _json_default(value):
     # Convert NumPy/Pandas scalars and arrays into standard JSON-compatible types.
     if isinstance(value, np.generic):
@@ -285,10 +415,11 @@ def run_single_encoding(base_dir, base_config, config_data, categorical_encoding
         n_estimators=config["num_trees"], random_state=config["random_state"]
     )
 
-    metric_suffix, last_train, mean_accuracy = train_model_cv(
+    metric_suffix, last_train, last_test, mean_accuracy = train_model_cv(
         model, features_matrix, labels, random_state=42
     )
     X_train, y_train = last_train
+    X_test, y_test = last_test
 
     run_id = (
         f"{model.__class__.__name__}_{config['run_tag']}_s{features_matrix.shape[0]}"
@@ -369,6 +500,7 @@ def run_single_encoding(base_dir, base_config, config_data, categorical_encoding
     )
 
     clarity_metrics = compute_clarity_metrics(explanation, feature_origin_map)
+    fidelity_metrics = compute_fidelity(explanation, model, X_test)
 
     return {
         "categorical_encoding": categorical_encoding,
@@ -380,6 +512,7 @@ def run_single_encoding(base_dir, base_config, config_data, categorical_encoding
         "num_dpg_edges": len(explanation.edge_metrics),
         "graph_depth": compute_graph_depth(explanation),
         **clarity_metrics,
+        **fidelity_metrics,
         # Not written to the scalar comparison CSV - kept for the
         # cross-encoding agreement comparison in main().
         "_node_labels": node_label_set(explanation),
@@ -403,7 +536,7 @@ def run_seed_stability_sweep(base_dir, base_config, config_data, categorical_enc
         )
 
         model = RandomForestClassifier(n_estimators=base_config["num_trees"], random_state=seed)
-        _metric_suffix, last_train, mean_accuracy = train_model_cv(
+        _metric_suffix, last_train, _last_test, mean_accuracy = train_model_cv(
             model, features_matrix, labels, random_state=seed
         )
         X_train, _y_train = last_train
