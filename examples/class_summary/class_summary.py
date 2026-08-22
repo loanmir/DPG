@@ -3,8 +3,7 @@ WP4: Categorical class summaries for DPG
 =========================================
 Turns the existing numeric-interval class summary (GraphMetrics.extract_class_boundaries,
 which treats every predicate - one-hot dummy columns included - as a plain numeric
-threshold) into a summary that speaks in category terms for one-hot encoded features,
-while leaving genuinely numeric/ordinal/target-encoded features untouched.
+threshold) into a summary that speaks in category terms for one-hot encoded features.
 
 This module only reads a live DPGExplanation (graph + nodes + target_names); it does
 not modify anything in dpg/ or metrics/. It reuses GraphMetrics.clustering - the same
@@ -19,12 +18,12 @@ from metrics.graph import GraphMetrics
 
 
 def is_categorical_predicate(label):
-    """A predicate node is treated as a one-hot dummy column iff it has the
+    """ 
+    Predicate node is treated as a one-hot dummy column iff it has the
     form '<base>_<category> <= 0.5' or '<base>_<category> > 0.5' - the only
     threshold a tree can use to split a 0/1 dummy column - and the column
     name splits at its last underscore into a base name and a non-numeric
-    category (so plain numeric columns like 'feature_2' are not mistaken
-    for one-hot columns). Mirrors the detection rule from WP3's
+    category. Mirrors the detection rule from WP3's
     categorical_view_conversion.py.
     """
     return parse_onehot_predicate(label) is not None
@@ -32,11 +31,11 @@ def is_categorical_predicate(label):
 
 
 def parse_onehot_predicate(label):
-    """Return (base_feature, category, direction) for a one-hot predicate
+    """
+    Return (base_feature, category, direction) for a one-hot predicate
     node, where direction is 'in' (feature_CAT > 0.5, i.e. feature IN {CAT})
     or 'out' (feature_CAT <= 0.5, i.e. feature NOT IN {CAT}). Returns None
-    for anything else (numeric predicates, class/leaf nodes, malformed
-    labels).
+    for anything else (numeric predicates, class nodes ... ).
     """
     match = re.match(r"^\s*(.+?)\s*(<=|>)\s*([-+]?\d*\.?\d+)\s*$", str(label))
     if not match:
@@ -69,9 +68,11 @@ def parse_onehot_predicate(label):
 
 
 def node_support(graph, node_id):
-    """How many original decision-path instances passed through this node,
+    """
+    How many original decision-path instances passed through a node,
     approximated as the total weight of its outgoing edges (every
-    non-leaf predicate node has at least one)."""
+    non-leaf predicate node has at least one).
+    """
     return sum(
         float(data.get("weight", 1.0))
         for _, _, data in graph.out_edges(node_id, data=True)
@@ -80,14 +81,14 @@ def node_support(graph, node_id):
 
 
 def build_category_support_table(graph, nodes, target_names, threshold=0.2):
-    """Associate each one-hot categorical predicate node with the class(es)
+    """
+    Associate each one-hot categorical predicate node with the class
     it supports, using the same clustering-based class<->node association
     GraphMetrics.extract_class_boundaries relies on internally.
 
     Returns {class_name: {base_feature: {category: {"in": support, "out": support}}}}
     and, alongside it, {node_label: {class_name: probability}} (the purity
-    signal from GraphMetrics.clustering, reused as-is rather than
-    recomputed).
+    signal from GraphMetrics.clustering is reused.
     """
     node_label_to_id = {label: node_id for node_id, label in nodes if "->" not in node_id}
     node_id_to_label = {v: k for k, v in node_label_to_id.items()}
@@ -132,8 +133,9 @@ def build_category_support_table(graph, nodes, target_names, threshold=0.2):
 
 
 def filter_rare_categories(feature_table, min_support_fraction=0.05):
-    """Bucket categories whose total support (in + out) falls under
-    min_support_fraction of the feature's total support into "OTHER",
+    """
+    Bucket categories whose total support (in + out) falls under
+    'min_support_fraction' of the feature's total support into "OTHER",
     so a long tail of rare categories can't dominate the summary.
     Returns (kept, other_totals, other_count).
     """
@@ -157,9 +159,10 @@ def filter_rare_categories(feature_table, min_support_fraction=0.05):
 
 def summarize_feature_for_class(base_feature, feature_table, min_support_fraction=0.05,
                                  dominance_threshold=0.5):
-    """Turn one (class, base_feature)'s raw support table into dominant
-    value / inclusion set / exclusion set facts. Returns None if nothing
-    survives filtering."""
+    """
+    Turn one (class, base_feature)'s raw support table into DOMINANT VALUE / INCLUSION SET / EXCLUSION SET facts. Returns None if nothing
+    survives filtering.
+    """
     kept, other, other_count = filter_rare_categories(feature_table, min_support_fraction)
     total = sum(v["in"] + v["out"] for v in kept.values()) + other["in"] + other["out"]
     if total == 0:
@@ -193,11 +196,10 @@ def summarize_feature_for_class(base_feature, feature_table, min_support_fractio
 
 
 def contrastive_categories(feature_table_a, feature_table_b, top_n=2, min_gap=0.15):
-    """Compare the same base_feature's raw (pre-filter) support between two
-    classes and return the categories with the largest share difference -
-    the "this class leans towards CAT far more than the other" statements.
-    Only returns gaps of at least min_gap (a share-difference floor, so
-    near-identical distributions produce no contrastive statement)."""
+    """
+    For a given feature, it finds which categories show up noticeably more in one class than the other, 
+    and skip anything where the two classes look about the same.
+    """
     categories = set(feature_table_a) | set(feature_table_b)
     total_a = sum(v["in"] for v in feature_table_a.values()) or 1.0
     total_b = sum(v["in"] for v in feature_table_b.values()) or 1.0
@@ -215,9 +217,11 @@ def contrastive_categories(feature_table_a, feature_table_b, top_n=2, min_gap=0.
 
 
 def numeric_boundary_feature_name(boundary):
-    """Extract the feature name out of a formatted boundary string, in any
+    """
+    Extracts the feature name out of a formatted boundary string, in any
     of the three shapes GraphMetrics.calculate_class_boundaries /
-    extract_class_boundaries can produce."""
+    extract_class_boundaries can produce.
+    """
     match = re.match(r"^\s*[-\d.eE+]+\s*<\s*(.+?)\s*<=", str(boundary))
     if match:
         return match.group(1).strip()
@@ -231,7 +235,8 @@ def numeric_boundary_feature_name(boundary):
 def build_new_style_summary(explanation, min_support_fraction=0.05,
                              dominance_threshold=0.5, contrastive_top_n=2,
                              clustering_threshold=0.2):
-    """Top-level entry point: build the new categorical-aware class summary
+    """
+    Top-level entry point: build the new categorical-aware class summary
     for every class in `explanation`.
 
     Returns {class_name: {"text": str, "structured": {...}}}.
@@ -294,8 +299,10 @@ def build_new_style_summary(explanation, min_support_fraction=0.05,
 
 
 def render_class_summary(class_name, numeric_boundaries, feature_summaries, contrastive_notes):
-    """Compact text template combining unchanged numeric bounds with the
-    new categorical statements."""
+    """
+    Compact text template combining unchanged numeric bounds with the
+    new categorical statements.
+    """
     lines = [f"Class {class_name}:"]
     if numeric_boundaries:
         lines.append("  Numeric: " + "; ".join(numeric_boundaries) + ".")

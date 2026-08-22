@@ -5,12 +5,11 @@ Trains one Random Forest on the Credit Card Approval dataset (one-hot
 encoded, the only encoding the new categorical summary style applies to -
 see class_summary.py), builds one DPG, and for each class compares:
 
-  * the existing numeric-interval summary (GraphMetrics.extract_class_boundaries,
-    unchanged - this is exactly what quickstart_categorical.py already saves)
-  * the new categorical-aware summary from class_summary.py
+   -> the existing numeric-interval summary (GraphMetrics.extract_class_boundaries,
+    UNCHANGED)
+   -> the new categorical-aware summary from class_summary.py
 
-on four measurements: compactness, redundancy, class-discriminative power,
-and purity. Self-contained: does not import quickstart_categorical.py.
+4 measurements: COMPACTNESS, REDUNDANCY, CLASS-DISCRIMINATIVE POWER, and PURITY. 
 """
 import sys
 import os
@@ -34,8 +33,10 @@ import class_summary
 
 
 def load_dataset(dataset_path, target_column):
-    # Minimal, one-hot-only loader (this module only reads mixed-type data
-    # to demonstrate the categorical summary style, not to sweep encodings).
+    """
+    Minimal, one-hot-only loader (this module only reads mixed-type data
+    to demonstrate the categorical summary style, not to sweep encodings).
+    """
     raw = pd.read_csv(dataset_path)
     features = raw.drop(columns=[target_column]).copy()
     labels = raw[target_column]
@@ -47,17 +48,14 @@ def load_dataset(dataset_path, target_column):
 
 
 def old_style_statements(boundaries):
-    """(feature,) for each old-style boundary line - deliberately coarse
-    (ignores the exact threshold value): comparing exact floats would
-    almost never match between two classes regardless of whether the
-    underlying fact is meaningfully class-specific, which would saturate
-    every discriminative-power score at 1.0 and make the comparison
-    meaningless. This also means a one-hot dummy column that gets a bound
-    in BOTH classes (e.g. once as "<= 0.5", once as "> 0.5") is counted as
-    shared/non-unique here, even though the two directions are actually
-    complementary and informative - a real limitation of the old style
-    that the new style's direction-tagged statements (see
-    new_style_statements) does not have."""
+    """
+    (feature,) for each old-style boundary line - deliberately coarse
+    It ignores the exact threshold value
+     
+    One side effect: if home_ownership_RENT <= 0.5 shows up for Class 0 and home_ownership_RENT > 0.5 shows up for Class 1, 
+    this check only looks at the feature name — not the direction — so it treats them as the same, non-unique fact, 
+    even though they actually say opposite things. The new style doesn't have this problem, since it keeps the direction as part of the fact
+    """
     stmts = []
     for boundary in boundaries:
         feature = class_summary.numeric_boundary_feature_name(boundary)
@@ -68,11 +66,12 @@ def old_style_statements(boundaries):
 
 
 def new_style_statements(structured):
-    """(feature, value) for every fact the new summary asserts - numeric
+    """
+    (feature, value) for every fact the new summary asserts - numeric
     bounds kept at the same coarse (feature,)-only granularity as old-style
     for a fair discriminative-power comparison, categorical facts kept at
-    (feature, category) granularity since that's the whole point of the
-    new format."""
+    (feature, category) granularity.
+    """
     stmts = []
     for boundary in structured["numeric_boundaries"]:
         feature = class_summary.numeric_boundary_feature_name(boundary)
@@ -90,10 +89,9 @@ def new_style_statements(structured):
 
 
 def count_same_feature_repeats(old_boundaries):
-    """Redundancy for the OLD style: how many extra boundary entries
-    (beyond the first) describe the same one-hot base feature - i.e. the
-    same underlying category, spread across several near-identical-looking
-    dummy-column entries instead of one combined statement."""
+    """
+    Counts how often the old style splits one category into several separate lines instead of one — each extra line about the same feature counts as redundant.
+    """
     bases = []
     for boundary in old_boundaries:
         feature = class_summary.numeric_boundary_feature_name(boundary)
@@ -108,17 +106,24 @@ def count_same_feature_repeats(old_boundaries):
 
 
 def count_new_style_repeats(structured):
-    """Redundancy for the NEW style: how many base features needed more
-    than one statement line to describe (should be 0 - render_class_summary
-    always collapses one feature into a single line)."""
+    """
+    Redundancy for the NEW style: how many base features needed more
+    than one statement line to describe.
+
+    -> should be 0 - render_class_summary always collapses one feature into a single line
+    """
     return 0  # invariant of the renderer; kept as a function for symmetry/clarity
 
 
 
 def discriminative_power(stmts_by_class):
-    """Fraction of a class's statements that are NOT also asserted (same
-    feature[, value]) for every other class - higher = the summary says
-    more that is actually specific to this class."""
+    """
+    Fraction of a class's statements that are NOT also asserted (same
+    feature[, value]) for every other class. 
+    
+    -> the HIGHER = the summary says
+    more that is actually specific to this class.
+    """
     classes = list(stmts_by_class.keys())
     scores = {}
     for c in classes:
@@ -136,12 +141,14 @@ def discriminative_power(stmts_by_class):
 
 
 def old_style_purity(boundaries, node_probs, class_name):
-    """Purity for OLD-style statements: for one-hot dummy boundaries the
-    boundary string IS a raw node label (a clean 0/1 split only ever uses
-    threshold 0.5), so it can be looked up directly. Genuinely numeric
-    bounds are merged across several nodes and have no single matching
-    node label - skipped (not applicable), same as the new style skips
-    them for the same reason."""
+    """
+    Purity for OLD-style statements: for one-hot dummy boundaries the
+    boundary string IS a raw node label, so it can be looked up directly. 
+    
+    Genuinely numeric bounds are merged across several nodes and have no single matching
+    node label - skipped, same as the new style skips
+    them for the same reason.
+    """
     class_key = f"Class {class_name}"
     values = []
     for boundary in boundaries:
@@ -153,9 +160,11 @@ def old_style_purity(boundaries, node_probs, class_name):
 
 
 def new_style_purity(structured, node_probs, class_name):
-    """Purity for NEW-style categorical statements, reconstructing the
+    """
+    Purity for NEW-style categorical statements, reconstructing the
     underlying raw node label for each asserted (feature, category,
-    direction) fact and reusing the same node-probability lookup."""
+    direction) fact and reusing the same node-probability lookup.
+    """
     class_key = f"Class {class_name}"
     values = []
     for fs in structured["categorical_features"]:
