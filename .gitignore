@@ -60,7 +60,8 @@ examples/results_german_credit
 examples/results_credit_card_approval
 examples/results_iris
 examples/results_cat
-examples/results_dummy
+examples/results_workPackage5
+examples/results_workPackage4
 wandb/
 
 examples/results_gridsearch

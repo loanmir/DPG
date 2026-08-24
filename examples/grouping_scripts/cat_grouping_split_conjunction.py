@@ -1,59 +1,72 @@
 """
-cat_grouping_split.py
-======================
+cat_grouping_split_conjunction.py
+===================================
 
-A more aggressive variant of ``cat_grouping.py``'s sequential grouping pass.
+A cross-feature variant of ``cat_grouping_split.py``.
 
-``cat_grouping._apply_grouping`` only merges two consecutive same-base /
-same-op categorical nodes when the chain between them is *strictly private*:
-the parent has exactly one outgoing edge (to the child) and the child has
-exactly one incoming edge (from the parent). That's the only shape where you
-can delete the child, fold its weight into the parent, and be sure you
-haven't corrupted some other branch that also relies on either node.
+``cat_grouping_split._split_then_merge`` only merges two categorical nodes
+when they test the *same* base feature with the *same* operator (``IN`` /
+``NOT IN``), because that's the only case where the combined predicate can
+be written as a single compact set (``base IN {A, B}``). Two categorical
+nodes on *different* features (or the same feature with a different
+operator) never merge, even when they sit on a strictly private chain.
 
-In a real DPG that shape is rare: DPG construction deliberately *unifies*
-identical predicate nodes that recur across many different rule paths, so a
-predicate like ``loan_intent NOT IN {VENTURE}`` is typically reached from
-several different parents (in-degree > 1), and a predicate like
-``loan_intent NOT IN {PERSONAL}`` typically leads to several different next
-tests (out-degree > 1). Under the strict rule almost nothing merges.
+That restriction was about label *formatting*, not structural safety: the
+in/out-degree privacy check that makes a merge safe to perform (see
+``cat_grouping_split``'s module docstring) never depended on the two nodes
+sharing a feature. Walking node 1 then node 2 on a single path *is* the
+logical conjunction of both conditions holding, regardless of what each one
+tests. So this script relaxes the merge criterion to "both nodes are
+categorical" (rewritten to ``IN``/``NOT IN`` form), and renders the combined
+predicate as a chain of clauses joined by ``AND``, compacting any
+consecutive clauses that *do* share a base feature + operator into one set
+just like before, e.g.::
 
-This script relaxes the rule by *splitting* the node that's in the way
-instead of refusing to merge:
+    person_education NOT IN {Bachelor} AND loan_intent IN {EDUCATION}
+    person_education NOT IN {Bachelor, Master} AND loan_intent IN {EDUCATION, VENTURE}
 
-* If the parent ``u`` has other children, ``u`` can't disappear -- but the
-  child ``v`` can still be relabelled in place to show the union of
-  categories (edge weight untouched), *provided* ``v`` belongs to ``u``
-  alone. If ``v`` is also shared by other parents, a private copy of ``v``
-  is cloned first (identical label + outgoing edges), so the original ``v``
-  is left completely untouched for its other parents, and the clone is what
-  gets relabelled.
-* If the parent ``u`` has exactly one outgoing edge (to ``v``), the merge is
-  identical to ``cat_grouping``'s strict rule: ``u`` absorbs ``v`` (cloning
-  it first if ``v`` is shared), ``u``'s id survives with the combined label,
-  and the weight folds forward onto whatever comes after ``v``.
+Numeric (non-categorical) nodes are deliberately excluded from every merge:
+a node only ever has a "clause" if its label parses as ``IN``/``NOT IN``
+(``cat_grouping._parse_in_label`` returns ``None`` for a plain numeric
+threshold like ``loan_amnt <= 16500.0``), so a numeric node always breaks
+the chain on both sides -- it can neither absorb a categorical neighbour nor
+be absorbed by one. Categorical-with-categorical is the only thing that
+ever merges here.
 
-The run is iterative and continues until no adjacent same-base/same-op pair
-remains, so chains of length 3+ still collapse to a single node exactly as
-in ``cat_grouping``.
+Dropping the same-feature restriction has one sharp edge: some of these
+DPGs are, once you stop caring which feature each edge tests, not actually
+acyclic. They're built by unifying identical predicate nodes across many
+different rules/trees, and different rules can test the same features in a
+different order, so a loop like ``loan_intent NOT IN {PERSONAL} ->
+person_gender IN {male} -> loan_intent NOT IN {VENTURE} -> loan_intent NOT
+IN {PERSONAL}`` genuinely exists in about a third of the bundled examples.
+``cat_grouping_split.py`` never noticed because its same-base/same-op
+restriction meant such a cross-feature loop could never be walked in the
+first place. Here it can, and folding/cloning around a real cycle has no
+fixed point -- it just keeps growing. So before merging anything, this
+script computes strongly connected components of the raw graph and
+permanently excludes any edge whose endpoints are in the same non-trivial
+component: those nodes are left exactly as the one-hot rewrite produced
+them, un-grouped, while every acyclic part of the graph still gets grouped
+as aggressively as described above.
 
-Trade-off: this can grow the node/edge count of a heavily-shared DPG --
-a shared predicate hub now shows up once per distinct merged chain it
-belongs to, rather than as a single canonical node -- in exchange for
-grouping every eligible chain instead of only the (rare) fully private ones.
+Everything else -- the split-then-merge mechanics (cloning a shared node
+rather than refusing to merge), the three merge cases (parent absorbs
+child, child relabelled in place, both cloned), and the weight-folding
+rules -- is identical to ``cat_grouping_split.py``; only the merge
+*criterion* and the label *formatting* change.
 
 For each processed subdirectory the script writes both the
-``..._DPG_split_grouped.png`` image and a
-``..._DPG_split_grouped_structure.json`` payload into the
-``wip/grouping_split/`` subdir, so it never overwrites whatever
-``cat_grouping.py`` (or anything else) already produced directly in
-``wip/``.
+``..._DPG_split_grouped_conjunction.png`` image and a
+``..._DPG_split_grouped_conjunction_structure.json`` payload into the
+``wip/grouping_split_conjunction/`` subdir, alongside (not overwriting)
+whatever ``cat_grouping.py`` / ``cat_grouping_split.py`` already produced.
 
 Usage
 -----
-    python examples/cat_grouping_split.py
-    python examples/cat_grouping_split.py --amount 10
-    python examples/cat_grouping_split.py --root examples/results_cat --amount 5
+    python examples/cat_grouping_split_conjunction.py
+    python examples/cat_grouping_split_conjunction.py --amount 10
+    python examples/cat_grouping_split_conjunction.py --root examples/results_cat --amount 5
 """
 
 from __future__ import annotations
@@ -71,6 +84,7 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
 import graphviz
+import networkx as nx
 import pandas as pd
 from networkx.readwrite import json_graph
 
@@ -78,7 +92,7 @@ from dpg.visualizer import plot_dpg
 
 # Reuse the (already-correct) one-hot rewrite + label parsing/formatting from
 # cat_grouping.py instead of re-implementing them here.
-from cat_grouping import (
+from DPG.examples.grouping_scripts.cat_grouping import (
     _build_label_map,
     _format_in_label,
     _iter_subdirs,
@@ -87,18 +101,44 @@ from cat_grouping import (
     _parse_in_label,
 )
 
+Clause = Tuple[str, str, List[str]]  # (base, op, cats)
+
 
 # ---------------------------------------------------------------------------
-# Split-then-merge grouping
+# Clause helpers: a merged node's predicate is a list of (base, op, cats)
+# clauses joined by AND, with adjacent same-base/same-op clauses compacted
+# into one set.
+# ---------------------------------------------------------------------------
+
+def _combine_clauses(a: List[Clause], b: List[Clause]) -> List[Clause]:
+    """``a`` followed by ``b`` (in path order), compacting the boundary if
+    ``a``'s last clause and ``b``'s first clause share a base + operator."""
+    combined: List[Clause] = [(base, op, list(cats)) for base, op, cats in a]
+    for base, op, cats in b:
+        if combined and combined[-1][0] == base and combined[-1][1] == op:
+            lb, lo, lc = combined[-1]
+            combined[-1] = (lb, lo, lc + list(cats))
+        else:
+            combined.append((base, op, list(cats)))
+    return combined
+
+
+def _format_clauses(clauses: List[Clause]) -> str:
+    return " AND ".join(_format_in_label(base, op, cats) for base, op, cats in clauses)
+
+
+# ---------------------------------------------------------------------------
+# Split-then-merge grouping (cross-feature conjunction variant)
 # ---------------------------------------------------------------------------
 
 def _split_then_merge(
     structure: dict,
     label_map: Dict[str, str],
 ) -> Tuple[Dict[str, str], Dict[Tuple[str, str], float]]:
-    """Group consecutive same-base/same-op categorical nodes as aggressively
-    as possible, cloning shared nodes so a merge never corrupts a branch it
-    doesn't belong to.
+    """Group consecutive categorical nodes as aggressively as possible,
+    regardless of whether they share a base feature or operator, cloning
+    shared nodes so a merge never corrupts a branch it doesn't belong to.
+    Numeric nodes never participate (see module docstring).
 
     Returns ``(labels, edges)`` describing the *entire* rebuilt graph (not a
     diff against ``structure``): every surviving node id maps to its final
@@ -118,6 +158,16 @@ def _split_then_merge(
     for n in nx_graph.nodes():
         labels.setdefault(str(n), label_map.get(str(n), ""))
 
+    # Every categorical node starts life as a single-clause conjunction.
+    # Numeric / Class nodes have no entry here at all -- that's what keeps
+    # them out of every merge below.
+    clauses: Dict[str, List[Clause]] = {}
+    for nid, label in labels.items():
+        parsed = _parse_in_label(label)
+        if parsed is not None:
+            base, op, cats = parsed
+            clauses[nid] = [(base, op, list(cats))]
+
     edges: Dict[Tuple[str, str], float] = {}
     for link in graph_data.get("edges", graph_data.get("links", [])):
         src, dst = str(link["source"]), str(link["target"])
@@ -128,6 +178,24 @@ def _split_then_merge(
         edges[(src, dst)] = edges.get((src, dst), 0.0) + w
 
     settled: Set[Tuple[str, str]] = set()
+
+    # Cross-feature merging can walk all the way around a real cycle (see
+    # module docstring) with no fixed point, since folding/cloning never
+    # makes progress on a loop. Find every strongly connected component of
+    # size > 1 up front and permanently refuse to merge across its edges --
+    # those nodes stay exactly as the one-hot rewrite produced them.
+    scc_id: Dict[str, int] = {}
+    scc_size: Dict[int, int] = {}
+    for i, component in enumerate(nx.strongly_connected_components(nx_graph)):
+        component = {str(n) for n in component}
+        scc_size[i] = len(component)
+        for n in component:
+            scc_id[n] = i
+    for (u0, v0) in edges:
+        cid = scc_id.get(u0)
+        if cid is not None and cid == scc_id.get(v0) and scc_size[cid] > 1:
+            settled.add((u0, v0))
+
     clone_counter = 0
 
     def _degrees() -> Tuple[Dict[str, int], Dict[str, int]]:
@@ -139,27 +207,26 @@ def _split_then_merge(
         return out_count, in_count
 
     def _clone_node(v: str) -> str:
-        """Private copy of ``v``: same label, same *current* outgoing
-        edges. Nothing points to it yet -- the caller wires up its single
-        incoming edge."""
+        """Private copy of ``v``: same label, same clauses, same *current*
+        outgoing edges. Nothing points to it yet -- the caller wires up its
+        single incoming edge."""
         nonlocal clone_counter
         clone_counter += 1
         v_copy = f"{v}#{clone_counter}"
         labels[v_copy] = labels[v]
+        clauses[v_copy] = list(clauses[v])
         for (s, d), w in list(edges.items()):
             if s == v:
                 edges[(v_copy, d)] = edges.get((v_copy, d), 0.0) + w
         return v_copy
 
-    def _fold_forward(
-        u: str, target: str, w_uv: float, base: str, op: str,
-        cats_u: List[str], cats_v: List[str],
-    ) -> None:
+    def _fold_forward(u: str, target: str, w_uv: float) -> None:
         """``u`` absorbs ``target`` (``v`` or a private clone of it): the
-        label combines, ``target``'s outgoing edges move onto ``u`` with
+        clauses combine, ``target``'s outgoing edges move onto ``u`` with
         ``w_uv`` folded into each, and ``target`` disappears. Requires
         ``edges[(u, target)] == w_uv`` to already be the case."""
-        labels[u] = _format_in_label(base, op, cats_u + cats_v)
+        clauses[u] = _combine_clauses(clauses[u], clauses[target])
+        labels[u] = _format_clauses(clauses[u])
         del edges[(u, target)]
         for (s, d), w in list(edges.items()):
             if s == target:
@@ -167,6 +234,7 @@ def _split_then_merge(
                 key = (u, d)
                 edges[key] = edges.get(key, 0.0) + w + w_uv
         labels.pop(target, None)
+        clauses.pop(target, None)
 
     max_iterations = 10 * (len(edges) + len(labels) + 10)
     for _ in range(max_iterations):
@@ -176,17 +244,15 @@ def _split_then_merge(
         for (u, v), w_uv in edges.items():
             if (u, v) in settled:
                 continue
-            pu, pv = _parse_in_label(labels[u]), _parse_in_label(labels[v])
-            if pu is None or pv is None or pu[0] != pv[0] or pu[1] != pv[1]:
+            if u not in clauses or v not in clauses:
                 settled.add((u, v))
                 continue
-            candidate = (u, v, w_uv, pu, pv)
+            candidate = (u, v, w_uv)
             break
         if candidate is None:
             break
 
-        u, v, w_uv, pu, pv = candidate
-        base, op = pu[0], pu[1]
+        u, v, w_uv = candidate
 
         if out_count.get(u, 0) == 1:
             # u has nowhere else to go: it can safely disappear.
@@ -196,17 +262,19 @@ def _split_then_merge(
                 target = _clone_node(v)
                 del edges[(u, v)]
                 edges[(u, target)] = w_uv
-            _fold_forward(u, target, w_uv, base, op, pu[2], pv[2])
+            _fold_forward(u, target, w_uv)
         elif in_count.get(v, 0) == 1:
             # v belongs to u alone: merge in place, weight untouched.
-            labels[v] = _format_in_label(base, op, pu[2] + pv[2])
+            clauses[v] = _combine_clauses(clauses[u], clauses[v])
+            labels[v] = _format_clauses(clauses[v])
             settled.add((u, v))
         else:
             # Both shared: clone v privately for u's branch and merge into
             # the clone, leaving the original v untouched for its other
             # parents.
             v_copy = _clone_node(v)
-            labels[v_copy] = _format_in_label(base, op, pu[2] + pv[2])
+            clauses[v_copy] = _combine_clauses(clauses[u], clauses[v])
+            labels[v_copy] = _format_clauses(clauses[v_copy])
             del edges[(u, v)]
             edges[(u, v_copy)] = w_uv
             settled.add((u, v_copy))
@@ -248,7 +316,7 @@ def _build_dot_from_graph(
     class_fillcolor = class_node_attrs.get("fillcolor") or default_fillcolor
 
     dot = graphviz.Digraph(
-        "dpg_cat_split_grouped",
+        "dpg_cat_split_grouped_conjunction",
         engine="dot",
         graph_attr=final_graph_attr,
         node_attr=final_node_attr if final_node_attr else None,
@@ -335,9 +403,9 @@ def _process_subdir(
     wip_dir: str,
     visualization_config: dict,
 ) -> Optional[str]:
-    """Rebuild a categorically-rewritten + split-then-merge-grouped DPG PNG
-    inside ``wip_dir``. Returns the path of the produced PNG, or ``None`` on
-    failure.
+    """Rebuild a categorically-rewritten + cross-feature split-then-merge
+    grouped DPG PNG inside ``wip_dir``. Returns the path of the produced
+    PNG, or ``None`` on failure.
     """
     run_id = os.path.basename(subdir.rstrip(os.sep))
     structure_path = os.path.join(subdir, f"{run_id}_dpg_structure.json")
@@ -354,7 +422,7 @@ def _process_subdir(
     df_nodes, df_edges = _build_synthetic_metrics_from_graph(labels, edges)
 
     os.makedirs(wip_dir, exist_ok=True)
-    output_name = f"{run_id}_DPG_split_grouped"
+    output_name = f"{run_id}_DPG_split_grouped_conjunction"
     plot_dpg(
         output_name,
         dot,
@@ -418,7 +486,7 @@ def main() -> int:
         f"(amount={args.amount if args.amount is not None else 'all'})."
     )
     for subdir in subdirs:
-        wip_dir = os.path.join(subdir, "wip", "grouping_split")
+        wip_dir = os.path.join(subdir, "wip", "grouping_split_conjunction")
         try:
             _process_subdir(subdir, wip_dir, visualization_config)
         except Exception as exc:  # pragma: no cover - best-effort reporting
