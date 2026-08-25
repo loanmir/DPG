@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DPG Interactive Runner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+    <header class="site-header">
+        <h1>DPG Interactive Runner</h1>
+        <p class="subtitle">
+            Pick a dataset + DPG hyper-parameters. The full pipeline &mdash;
+            raw DPG, categorical view, sequential grouping, split-then-merge
+            grouping, and the cross-feature AND variant &mdash; will be
+            re-run from scratch whenever any value changes.
+        </p>
+    </header>
+
+    <section class="controls">
+        <form id="run-form" autocomplete="off">
+            <div class="control">
+                <label for="dataset">Dataset</label>
+                <select id="dataset" name="dataset">
+                    {% for ds in datasets %}
+                        <option value="{{ ds }}"
+                                {% if ds == defaults.dataset %}selected{% endif %}>
+                            {{ ds }}
+                        </option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="control">
+                <label for="perc_var">perc_var</label>
+                <input id="perc_var" name="perc_var" type="number"
+                       step="0.005" min="0.005" max="0.5"
+                       value="{{ defaults.perc_var }}" />
+                <small>Variance threshold for predicate quantisation.</small>
+            </div>
+
+            <div class="control">
+                <label for="decimal_threshold">decimal_threshold</label>
+                <input id="decimal_threshold" name="decimal_threshold" type="number"
+                       step="1" min="1" max="6"
+                       value="{{ defaults.decimal_threshold }}" />
+                <small>Number of decimals kept on predicates.</small>
+            </div>
+
+            <div class="control">
+                <label for="community_threshold">community_threshold</label>
+                <input id="community_threshold" name="community_threshold" type="number"
+                       step="0.05" min="0.05" max="1.0"
+                       value="{{ defaults.community_threshold }}" />
+                <small>Threshold passed to community detection.</small>
+            </div>
+
+            <div class="control submit">
+                <button id="run-btn" type="submit">Run pipeline</button>
+                <span id="status" class="status idle">Idle.</span>
+            </div>
+        </form>
+    </section>
+
+    <section class="results">
+        <div class="metrics" id="metrics">
+            <h2>Metrics</h2>
+            <dl id="metrics-dl">
+                <dt><em>no run yet</em></dt>
+            </dl>
+        </div>
+
+        <div class="errors" id="errors" hidden>
+            <h2>Errors</h2>
+            <pre id="errors-pre"></pre>
+        </div>
+
+        {% for label, title in stage_labels.items() %}
+            <div class="stage" id="stage-{{ label }}">
+                <h2>{{ title }}</h2>
+                <div class="img-frame">
+                    <img data-label="{{ label }}" alt="{{ title }} (awaiting run)" />
+                </div>
+            </div>
+        {% endfor %}
+    </section>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
