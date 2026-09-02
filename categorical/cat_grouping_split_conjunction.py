@@ -92,7 +92,7 @@ from dpg.visualizer import plot_dpg
 
 # Reuse the (already-correct) one-hot rewrite + label parsing/formatting from
 # cat_grouping.py instead of re-implementing them here.
-from DPG.examples.grouping_scripts.cat_grouping import (
+from .cat_grouping import (
     _build_label_map,
     _format_in_label,
     _iter_subdirs,

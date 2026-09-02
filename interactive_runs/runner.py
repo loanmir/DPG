@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Optional
 # call the existing pipeline functions directly (no subprocesses).
 INTERACTIVE_DIR = os.path.abspath(os.path.dirname(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(INTERACTIVE_DIR, ".."))
-GROUPING_DIR = os.path.join(PROJECT_ROOT, "examples", "grouping_scripts")
+GROUPING_DIR = os.path.join(PROJECT_ROOT, "categorical")
 for p in (PROJECT_ROOT, GROUPING_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -220,15 +220,15 @@ def _stage_wip(
     that). ``"grouping_split"`` and ``"grouping_split_conjunction"`` match
     the names the standalone CLIs use in their ``main()``.
 
-    Each grouping script does
-    ``from DPG.examples.grouping_scripts.cat_grouping import …``
-    (``DPG`` = the project root directory, one level above this file).
-    We've already added the parent directory to ``sys.path`` at module load
-    time, so the import resolves as ``examples.grouping_scripts.<name>``.
+    Each grouping script lives next door under ``DPG/categorical/`` and
+    does ``from .cat_grouping import …`` (relative import inside the
+    ``categorical`` package). We've already added the project root to
+    ``sys.path`` at module load time, so the import resolves as
+    ``categorical.<script_name>``.
     """
     import importlib
 
-    full_mod = f"examples.grouping_scripts.{script_name}"
+    full_mod = f"categorical.{script_name}"
     mod = importlib.import_module(full_mod)
     fn = getattr(mod, fn_name)
     out_dir = req.out_dir()
