@@ -1,348 +1,140 @@
 #!/usr/bin/env python3
-"""Run categorical features experiments for all datasets with all grouping scripts.
+"""Run a full basic-DPG + categorical-grouping pipeline for every dataset.
 
-This is the categorical-features counterpart of ``run_all_experiments.py``
-(``DPG/counterfactual/scripts/run_all_experiments.py``). Where that
-script uses the counterfactual dataset loader and runs
-``run_experiment.py`` for each (dataset, method) pair, this script:
+For each dataset folder under ``DPG/datasets/`` (every entry except
+``dummy_dataset``, which is toy data used only for gridsearch sweeps), this
+script:
 
-* treats every subdirectory of ``DPG/datasets/`` as a dataset (no YAML
-  loader, no method axis -- the "method" axis is replaced by the
-  grouping script),
-* iterates every known *grouping* script inside ``DPG/categorical/``
-  (the three ``cat_grouping*`` modules; ``__init__``, this orchestrator
-  and the one-hot-rewrite ``categorical_view_conversion.py`` are all
-  skipped) and invokes each script's ``_process_subdir`` against the
-  matching per-dataset DPG outputs,
-* writes all rendered PNGs and rewritten JSON structures into an
-  unversioned output directory (defaults to
-  ``DPG/outputs/categorical/<timestamp>/``),
-* pushes the same artifacts to Weights & Biases under the project
-  ``dpg-categorical``, using the same workspace entity as the
-  counterfactual ``run_all_experiments.py`` script
-  (``mllab-ts-universit-di-trieste``) and a wandb ``group`` of
-  ``run_all_categorical`` so the runs appear together in the UI.
+1. Trains a RandomForest on the dataset's CSV and builds a "basic" DPG
+   explanation -- the same recipe as ``examples/quickstart.py`` (one-hot
+   encode categorical columns, 5-fold CV, ``DPGExplainer.explain_global``
+   with ``communities=True``).
+2. Feeds the resulting DPG structure JSON through the three grouping
+   scripts living next to this one: ``cat_grouping.py``,
+   ``cat_grouping_split.py`` and ``cat_grouping_split_conjunction.py``.
+3. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in four fixed
+   subfolders:
 
-The DPG subdirs each grouping script consumes are not produced here --
-they are assumed to already exist on disk (e.g. written by
-``gridsearch_dpg.py`` / ``gridsearch_dpg_catsim.py`` into
-``DPG/examples/results_gridsearch/`` and ``DPG/examples/results_cat/``).
-For each dataset we discover which DPG subdirs match the dataset name,
-group them per results root, and feed each group to the matching
-grouping script.
+     * ``BASIC DPG``                      -- the raw DPGExplainer output
+     * ``GROUPED DPG``                    -- cat_grouping.py output
+     * ``GROUPED-SPLIT DPG``              -- cat_grouping_split.py output
+     * ``GROUPED-SPLIT-CONJUCTION DPG``   -- cat_grouping_split_conjunction.py output
+
+Every dataset's target column is assumed to be its last CSV column (titanic's
+``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
+other dataset). Feature columns are one-hot encoded as-is (same as
+``gridsearch_dpg.py``), except columns listed in ``DROP_COLUMNS_OVERRIDES``
+-- currently titanic's ``PassengerId``, ``Name``, ``Ticket`` and ``Cabin``,
+which are IDs / near-unique free text that would otherwise explode into
+hundreds of one-hot columns. Datasets listed in ``PERC_VAR_OVERRIDES`` use a
+smaller ``perc_var`` than ``config.yaml``'s default -- titanic's RandomForest
+otherwise produces zero surviving decision paths at the default 0.01.
+
+Optionally logs everything to Weights & Biases (project ``dpg-categorical``,
+same entity as the counterfactual pipeline), one run per dataset.
 
 Usage
 -----
-    # Full sweep (every dataset x every grouping script, against every
-    # known results root)
     python DPG/categorical/run_all_categorical_experiments.py
-
-    # Restrict the dataset and/or script axes
-    python DPG/categorical/run_all_categorical_experiments.py --datasets iris german_credit
-    python DPG/categorical/run_all_categorical_experiments.py --scripts cat_grouping.py
-
-    # Restrict the DPG results roots searched for each dataset
-    python DPG/categorical/run_all_categorical_experiments.py --results-roots \\
-        DPG/examples/results_cat DPG/examples/results_gridsearch
-
-    # Skip (dataset, script) combinations that already have artifacts
-    python DPG/categorical/run_all_categorical_experiments.py --skip-existing
-
-    # Dry-run / offline / parallel
+    python DPG/categorical/run_all_categorical_experiments.py --datasets iris titanic
     python DPG/categorical/run_all_categorical_experiments.py --dry-run
-    python DPG/categorical/run_all_categorical_experiments.py --offline
-    python DPG/categorical/run_all_categorical_experiments.py --parallel 4
+    python DPG/categorical/run_all_categorical_experiments.py --no-wandb
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
-import os
+import json
 import pathlib
 import shutil
 import sys
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import matplotlib
+
+# This script only ever saves plots to disk (show=False everywhere) and
+# never displays them, so force the non-interactive Agg backend before
+# ``dpg`` (which imports matplotlib.pyplot) is loaded. Otherwise matplotlib
+# defaults to the interactive TkAgg backend whenever tkinter is available,
+# and garbage-collecting the leftover Tk widget objects at interpreter
+# shutdown prints harmless but noisy "Exception ignored in ... main thread
+# is not in main loop" tracebacks.
+matplotlib.use("Agg")
+
+import numpy as np
+import pandas as pd
+import yaml
+from networkx.readwrite import json_graph
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import KFold
 
 # --- Repo / import setup --------------------------------------------------
-# The script now lives under ``DPG/categorical/`` (it isn't counterfactual
-# work, so it was moved out of ``DPG/counterfactual/scripts/``). That
-# means ``utils.experiment_status`` -- which lives under
-# ``DPG/counterfactual/utils/`` -- is no longer importable via the old
-# "sibling of the utils package" trick. We add both the DPG project root
-# (so ``dpg`` etc. resolve) and the ``DPG/counterfactual/`` directory
-# (so ``utils.experiment_status`` resolves) to ``sys.path``. The grouping
-# scripts live right next to us under ``CATEGORICAL_DIR`` and don't need
-# any extra path entry to find each other.
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
-CATEGORICAL_DIR = SCRIPT_DIR  # DPG/categorical/
 REPO_ROOT = SCRIPT_DIR.parent  # DPG/
-COUNTERFACTUAL_ROOT = REPO_ROOT / "counterfactual"
 
-for p in (str(REPO_ROOT), str(COUNTERFACTUAL_ROOT)):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from utils.experiment_status import (  # noqa: E402
-    PersistentStatus,
-    get_experiment_status,
-    write_status,
-)
+from dpg import DPGExplainer  # noqa: E402
+from metrics.graph import GraphMetrics  # noqa: E402
 
-# The grouping scripts now live right next to us (in the ``categorical``
-# package). We use this path as the default for ``--grouping-dir`` and
-# for ``discover_scripts`` so the same folder is consulted regardless of
-# where the user runs the script from.
-GROUPING_DIR = CATEGORICAL_DIR
+# --- Constants --------------------------------------------------------------
 
-# --- Constants ------------------------------------------------------------
-
-# Same workspace entity as the counterfactual ``run_all_experiments.py``
-# pipeline (``CounterFactualDPG`` project, ``mllab-ts-universit-di-trieste``
-# team). We log into a *new* project so the categorical runs stay isolated
-# from the counterfactual ones.
 WANDB_PROJECT = "dpg-categorical"
 WANDB_ENTITY = "mllab-ts-universit-di-trieste"
-WANDB_GROUP = "run_all_categorical"
+WANDB_GROUP = "run_all_categorical_basic"
 
-# Where each ``(dataset, script)`` writes its PNGs + JSON payloads.
+DEFAULT_DATASETS_DIR = REPO_ROOT / "datasets"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "categorical"
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 
-# Names of "results roots" the grouping scripts accept via ``--root``.
-# These are checked in order; the first one that contains matching DPG
-# subdirs for a given dataset wins.
-DEFAULT_RESULTS_ROOTS: Tuple[pathlib.Path, ...] = (
-    REPO_ROOT / "examples" / "results_cat",
-    REPO_ROOT / "examples" / "results_gridsearch",
+# Folder that holds toy/sweep data, not a real dataset.
+EXCLUDED_DATASET_DIRS = {"dummy_dataset"}
+
+# Fixed output subfolder names, exactly as requested.
+BASIC_LABEL = "BASIC DPG"
+GROUPED_LABEL = "GROUPED DPG"
+SPLIT_LABEL = "GROUPED-SPLIT DPG"
+CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUCTION DPG"
+
+# The three grouping scripts to run against each basic DPG structure,
+# keyed by their importable module name (relative to the ``categorical``
+# package) and mapped to the output subfolder they write into.
+GROUPING_MODULES: Tuple[Tuple[str, str], ...] = (
+    ("categorical.cat_grouping", GROUPED_LABEL),
+    ("categorical.cat_grouping_split", SPLIT_LABEL),
+    ("categorical.cat_grouping_split_conjunction", CONJUNCTION_LABEL),
 )
 
-# Same-module name (``__init__.py``) is not a script.
-EXCLUDED_SCRIPT_FILES = {"__init__.py"}
-
-# Files inside ``datasets/`` that aren't real dataset subdirs (e.g.
-# ``custom.csv`` lives directly in ``datasets/``).
-EXCLUDED_DATASET_NAMES = {"custom.csv"}
-
-# Per-script mapping: ``module_file -> (wip_subdir_relative_to_run_dir,
-#                                       output_file_suffix)``.
-#
-# * ``wip_subdir`` is what the existing standalone CLI uses when it calls
-#   its own ``_process_subdir``; we mirror that so the on-disk layout we
-#   produce matches what the standalone CLI produces for any single
-#   dataset (handy when diffing). Pass ``""`` for "write directly into
-#   ``wip/``".
-# * ``output_suffix`` is appended to the run-id to form the rendered
-#   filename; again, mirrors the standalone CLIs.
-#
-# Only the *grouping* scripts are registered. ``categorical_view_conversion.py``
-# is intentionally excluded -- it's an ablation step (the one-hot rewrite
-# used while hunting for the best visual examples) and not a grouping pass.
-SCRIPT_REGISTRY: Dict[str, Dict[str, str]] = {
-    "cat_grouping.py": {
-        "wip_subdir": "",
-        "output_suffix": "_DPG_grouped",
-        "label": "grouped",
-    },
-    "cat_grouping_split.py": {
-        "wip_subdir": "grouping_split",
-        "output_suffix": "_DPG_split_grouped",
-        "label": "split",
-    },
-    "cat_grouping_split_conjunction.py": {
-        "wip_subdir": "grouping_split_conjunction",
-        "output_suffix": "_DPG_split_grouped_conjunction",
-        "label": "conjunction",
-    },
+# Columns to drop before one-hot encoding: pure row IDs or near-unique
+# free text that would otherwise explode into hundreds of one-hot columns.
+DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
+    "titanic": ["PassengerId", "Name", "Ticket", "Cabin"],
 }
 
+# Per-dataset perc_var override (see config.yaml's ``dpg.default.perc_var``).
+# perc_var is a *minimum* fraction of paths a pattern must appear in to be
+# kept, so a smaller value keeps MORE paths. The repo default (0.01) leaves
+# titanic with zero surviving paths (its RandomForest produces too many
+# distinct root-to-leaf paths for any one to clear a 1% bar), so it needs a
+# smaller perc_var than the default.
+PERC_VAR_OVERRIDES: Dict[str, float] = {
+    "titanic": 0.005,
+}
 
-# --- Coloured output ------------------------------------------------------
-
-class C:
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    MAGENTA = "\033[95m"
-    CYAN = "\033[96m"
-
-
-# --- Domain types ---------------------------------------------------------
+NUM_TREES = 10
+RANDOM_STATE = 27
+N_SPLITS = 5
+COMMUNITY_THRESHOLD = 0.2
 
 
-@dataclass
-class DatasetMatch:
-    """A single (dataset, results_root, matching_dpg_subdirs) bundle."""
-
-    dataset: str
-    results_root: pathlib.Path
-    matching_subdirs: List[pathlib.Path] = field(default_factory=list)
-
-
-@dataclass
-class Experiment:
-    dataset: str
-    script_name: str
-    run_id: str
-    wip_subdir: str
-    output_suffix: str
-    output_dir: pathlib.Path  # absolute path of the run-specific output dir
-    matches: List[DatasetMatch] = field(default_factory=list)
-
-    @property
-    def key(self) -> str:
-        return f"{self.dataset}/{self.script_name}"
-
-    @property
-    def status_dir(self) -> pathlib.Path:
-        return pathlib.Path(
-            self.output_dir
-        ).parent.parent / ".experiment_status"  # shared with run_all
-
-
-# --- Discovery helpers ----------------------------------------------------
-
-
-def discover_datasets(datasets_dir: pathlib.Path) -> List[str]:
-    """Return the sorted list of dataset subdir names under ``datasets_dir``."""
-    if not datasets_dir.exists():
-        return []
-    names = [
-        entry.name
-        for entry in datasets_dir.iterdir()
-        if entry.is_dir() and entry.name not in EXCLUDED_DATASET_NAMES
-    ]
-    return sorted(names)
-
-
-def discover_scripts(grouping_dir: pathlib.Path) -> List[str]:
-    """Return the sorted list of grouping-script filenames."""
-    if not grouping_dir.exists():
-        return []
-    return sorted(
-        p.name
-        for p in grouping_dir.iterdir()
-        if p.is_file()
-        and p.suffix == ".py"
-        and p.name not in EXCLUDED_SCRIPT_FILES
-        and p.name in SCRIPT_REGISTRY  # only run scripts we know about
-    )
-
-
-def _short_dataset_tag(csv_filename: str) -> str:
-    """Mirror the ``ds=<tag>`` tag the gridsearch scripts use.
-
-    ``gridsearch_dpg.py`` / ``gridsearch_dpg_catsim.py`` strip the
-    ``toy_`` prefix and the ``.csv`` extension when building the
-    ``ds=<tag>_pv=...`` subdir name, so:
-
-      * ``toy_chain_intent_a_ab.csv`` -> ``chain_intent_a_ab``
-      * ``toy_cat1_gender.csv``       -> ``cat1_gender``
-      * ``iris.csv``                  -> ``iris``
-    """
-    tag = csv_filename
-    if tag.lower().endswith(".csv"):
-        tag = tag[:-4]
-    if tag.startswith("toy_"):
-        tag = tag[len("toy_"):]
-    return tag
-
-
-def discover_dataset_tags(dataset_dir: pathlib.Path) -> List[str]:
-    """Return the sorted set of ``ds=<tag>``-compatible tags derivable from
-    the CSV files living directly inside ``dataset_dir``.
-
-    An empty list means the dataset subdir either has no CSVs or they
-    don't follow the ``toy_*.csv`` convention; either way no matching
-    DPG results exist and the caller should skip it.
-    """
-    if not dataset_dir.exists() or not dataset_dir.is_dir():
-        return []
-    tags: List[str] = []
-    for entry in dataset_dir.iterdir():
-        if not entry.is_file():
-            continue
-        if not entry.name.lower().endswith(".csv"):
-            continue
-        tag = _short_dataset_tag(entry.name)
-        if tag:
-            tags.append(tag)
-    return sorted(set(tags))
-
-
-def discover_matching_subdirs(
-    dataset_tags: Iterable[str], results_root: pathlib.Path
-) -> List[pathlib.Path]:
-    """Return subdirs of ``results_root`` whose ``ds=<tag>`` prefix matches
-    any of ``dataset_tags``.
-
-    The DPG subdir naming convention is ``ds=<tag>_pv=..._dt=..._ct=...``
-    (see ``gridsearch_dpg.py`` / ``gridsearch_dpg_catsim.py``). We only
-    accept the structured ``ds=`` form so a CSV like ``iris.csv``
-    doesn't accidentally match an unrelated subdir whose name happens to
-    contain the substring ``iris``.
-    """
-    if not results_root.exists():
-        return []
-    tag_set = set(dataset_tags)
-    matches: List[pathlib.Path] = []
-    for entry in sorted(results_root.iterdir()):
-        if not entry.is_dir():
-            continue
-        name = entry.name
-        if not name.startswith("ds="):
-            continue
-        # Strip ``ds=`` prefix, then peel off the trailing ``_pv=...`` (if
-        # present) so we can do an exact tag match. Anything else (e.g.
-        # ``ds=iris`` without a ``_pv=`` suffix) is matched on the bare
-        # ``ds=iris`` form.
-        body = name[len("ds="):]
-        if "_pv=" in body:
-            tag = body.split("_pv=", 1)[0]
-        else:
-            tag = body
-        if tag in tag_set:
-            matches.append(entry)
-    return matches
-
-
-def build_dataset_matches(
-    datasets: Iterable[str],
-    datasets_dir: pathlib.Path,
-    results_roots: Iterable[pathlib.Path],
-) -> List[DatasetMatch]:
-    """Pair each dataset with the (first) results root that has any subdirs
-    matching one of the dataset's CSV-derived tags, plus those subdirs.
-
-    Datasets whose subdir contains no matching CSVs (or no matching DPG
-    results exist for any of them) are dropped from the returned list --
-    the caller skips them with a "no matching DPG subdirs" message rather
-    than treating "no work to do" as a hard failure.
-    """
-    matches: List[DatasetMatch] = []
-    for ds in datasets:
-        tags = discover_dataset_tags(datasets_dir / ds)
-        if not tags:
-            continue
-        for root in results_roots:
-            subs = discover_matching_subdirs(tags, root)
-            if subs:
-                matches.append(
-                    DatasetMatch(
-                        dataset=ds, results_root=root, matching_subdirs=subs
-                    )
-                )
-                break
-    return matches
-
-
-# --- WandB helpers --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# WandB (optional)
+# ---------------------------------------------------------------------------
 
 try:
     import wandb
@@ -353,84 +145,49 @@ except ImportError:  # pragma: no cover - wandb is a hard dep of the project
     wandb = None  # type: ignore[assignment]
 
 
-def wandb_init_for_experiment(
-    experiment: Experiment,
-    offline: bool,
-    extra_config: Optional[Dict[str, object]] = None,
-):
-    """Initialise a wandb run for one (dataset, script) experiment.
-
-    Returns the ``wandb.Run`` object on success, ``None`` if wandb is
-    unavailable. The run is configured to land in the
-    ``dpg-categorical`` project under the same entity as the
-    counterfactual ``run_all_experiments.py`` script, grouped under
-    ``run_all_categorical`` so all runs from this script appear together
-    in the wandb UI.
-    """
+def wandb_init_for_dataset(dataset_name: str, csv_path: pathlib.Path, offline: bool):
     if not WANDB_AVAILABLE:
         return None
-    cfg = {
-        "dataset": experiment.dataset,
-        "grouping_script": experiment.script_name,
-        "output_suffix": experiment.output_suffix,
-        "n_matching_subdirs": sum(
-            len(m.matching_subdirs) for m in experiment.matches
-        ),
-        "results_roots": [
-            str(m.results_root) for m in experiment.matches
-        ],
-    }
-    if extra_config:
-        cfg.update(extra_config)
     mode = "offline" if offline else "online"
     return wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         group=WANDB_GROUP,
-        job_type="categorical_grouping",
-        name=experiment.key.replace(os.sep, "__"),
-        config=cfg,
+        job_type="basic_dpg_and_grouping",
+        name=dataset_name,
+        config={"dataset": dataset_name, "csv": str(csv_path)},
         mode=mode,
     )
 
 
 def wandb_log_artifacts(run, artifacts: List[pathlib.Path]) -> None:
-    """Log each path as a wandb artifact and image (PNG only).
-
-    PNGs are also pushed via ``wandb.Image`` so they show up in the run's
-    media panel. JSON files become ``<key>_structure`` artifacts so they
-    can be re-fetched later.
-    """
+    """Log each path as a wandb artifact (and image, for PNGs)."""
     if run is None:
         return
-    import mimetypes
-
     for path in artifacts:
-        if not path.exists():
+        if not path.is_file():
             continue
-        mime, _ = mimetypes.guess_type(str(path))
         ext = path.suffix.lower()
-        artifact_name = f"{path.parent.name}__{path.stem}"
+        artifact_name = f"{path.parent.name}__{path.stem}".replace(" ", "_")
         if ext == ".png":
             try:
                 run.log({f"images/{path.parent.name}/{path.stem}": wandb.Image(str(path))})
             except Exception as exc:  # pragma: no cover - best effort
-                print(f"  {C.DIM}[wandb] could not log image {path.name}: {exc}{C.RESET}")
+                print(f"  [wandb] could not log image {path.name}: {exc}")
             try:
                 art = wandb.Artifact(artifact_name, type="dpg_image")
                 art.add_file(str(path))
                 run.log_artifact(art)
             except Exception as exc:  # pragma: no cover - best effort
-                print(f"  {C.DIM}[wandb] could not log artifact {path.name}: {exc}{C.RESET}")
+                print(f"  [wandb] could not log artifact {path.name}: {exc}")
         elif ext == ".json":
             try:
                 art = wandb.Artifact(artifact_name, type="dpg_structure")
                 art.add_file(str(path))
                 run.log_artifact(art)
             except Exception as exc:  # pragma: no cover - best effort
-                print(f"  {C.DIM}[wandb] could not log artifact {path.name}: {exc}{C.RESET}")
+                print(f"  [wandb] could not log artifact {path.name}: {exc}")
         else:
-            # Anything else (txt, csv, ...): log as a generic file artifact.
             try:
                 art = wandb.Artifact(artifact_name, type="dpg_aux")
                 art.add_file(str(path))
@@ -439,173 +196,324 @@ def wandb_log_artifacts(run, artifacts: List[pathlib.Path]) -> None:
                 pass
 
 
-# --- Per-experiment execution --------------------------------------------
+# ---------------------------------------------------------------------------
+# Dataset discovery + loading
+# ---------------------------------------------------------------------------
 
 
-def _load_visualization_config(config_path: pathlib.Path) -> dict:
-    """Mirror of the per-script ``_load_visualization_config`` helper."""
-    import yaml
+def discover_dataset_csvs(
+    datasets_dir: pathlib.Path, only: Optional[Sequence[str]]
+) -> List[Tuple[str, pathlib.Path]]:
+    """Return ``(dataset_name, csv_path)`` for every dataset subfolder.
 
-    with open(config_path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
-
-
-def run_one_experiment(
-    experiment: Experiment,
-    visualization_config: dict,
-    offline: bool,
-    dry_run: bool = False,
-) -> Tuple[bool, List[pathlib.Path]]:
-    """Run one ``(dataset, grouping_script)`` experiment in-process.
-
-    Invokes the grouping script's ``_process_subdir`` for every matching
-    DPG subdir, redirects ``wip_dir`` to the unversioned output tree, and
-    returns ``(success, produced_artifact_paths)``.
-
-    Returns ``(False, [])`` for the "no matching DPG subdirs" case so the
-    caller can record a skip rather than a hard error.
+    Skips ``dummy_dataset`` and any subfolder with no CSV inside. If a
+    subfolder has more than one CSV, the first (sorted) one is used and a
+    warning is printed.
     """
-    if not experiment.matches:
-        return False, []
-
-    if dry_run:
-        # Just announce what would happen and return success-ish.
-        total = sum(len(m.matching_subdirs) for m in experiment.matches)
-        print(
-            f"  {C.DIM}[dry-run] would process {total} DPG subdir(s) "
-            f"for {experiment.dataset}{C.RESET}"
-        )
-        return True, []
-
-    # Each ``_process_subdir`` writes inside the ``wip_dir`` we pass;
-    # naming follows the per-script convention (directly into ``wip/``
-    # for cat_view / cat_grouping, into ``wip/<wip_subdir>/`` for the
-    # two split variants).
-    script_module = importlib.import_module(
-        f"categorical.{experiment.script_name[:-3]}"
-    )
-    process_subdir = script_module._process_subdir
-
-    # All matching subdirs from all selected results roots share the same
-    # ``wip_dir`` (one experiment = one dataset x one grouping script).
-    wip_dir = (
-        experiment.output_dir / "wip" / experiment.wip_subdir
-        if experiment.wip_subdir
-        else experiment.output_dir / "wip"
-    )
-    wip_dir.mkdir(parents=True, exist_ok=True)
-
-    produced: List[pathlib.Path] = []
-    failed = 0
-    for match in experiment.matches:
-        for subdir in match.matching_subdirs:
-            try:
-                out_png = process_subdir(str(subdir), str(wip_dir), visualization_config)
-            except Exception as exc:  # noqa: BLE001 - report and continue
-                print(
-                    f"  {C.RED}[err]{C.RESET} {subdir.name}: {exc}"
-                )
-                failed += 1
-                continue
-            if out_png is None:
-                # Helper explicitly said "skip" (missing structure file, etc.).
-                continue
-            png_path = pathlib.Path(out_png)
-            produced.append(png_path)
-            # The rewritten/merged structure JSON lives next to the PNG
-            # for ``cat_grouping*`` scripts; pick it up so wandb sees it.
-            for json_candidate in wip_dir.glob(f"{subdir.name}*structure*.json"):
-                produced.append(json_candidate)
-
-    if failed and not produced:
-        return False, produced
-    return True, produced
-
-
-def build_experiments(
-    dataset_matches: List[DatasetMatch],
-    scripts: List[str],
-    output_root: pathlib.Path,
-    skip_existing: bool,
-) -> List[Experiment]:
-    """Build the experiment list (and skip already-completed ones if asked)."""
-    experiments: List[Experiment] = []
-    for match in dataset_matches:
-        for script_name in scripts:
-            meta = SCRIPT_REGISTRY[script_name]
-            output_dir = output_root / match.dataset / meta["label"]
-            exp = Experiment(
-                dataset=match.dataset,
-                script_name=script_name,
-                run_id=f"{match.dataset}__{meta['label']}",
-                wip_subdir=meta["wip_subdir"],
-                output_suffix=meta["output_suffix"],
-                output_dir=output_dir,
-                matches=[match],
+    if not datasets_dir.exists():
+        return []
+    only_set = set(only) if only else None
+    pairs: List[Tuple[str, pathlib.Path]] = []
+    for entry in sorted(datasets_dir.iterdir()):
+        if not entry.is_dir() or entry.name in EXCLUDED_DATASET_DIRS:
+            continue
+        if only_set is not None and entry.name not in only_set:
+            continue
+        csvs = sorted(entry.glob("*.csv"))
+        if not csvs:
+            print(f"  [skip] {entry.name}: no CSV file found")
+            continue
+        if len(csvs) > 1:
+            print(
+                f"  [warn] {entry.name}: {len(csvs)} CSVs found, "
+                f"using {csvs[0].name}"
             )
-
-            if skip_existing:
-                status, _ = get_experiment_status(
-                    match.dataset,
-                    f"cat__{meta['label']}",
-                    pathlib.Path(output_root),
-                )
-                if status == PersistentStatus.FINISHED:
-                    exp_key = f"{exp.dataset}/{exp.script_name}"
-                    print(
-                        f"  {C.YELLOW}[skip]{C.RESET} {exp_key} "
-                        f"(already finished; pass without --skip-existing to re-run)"
-                    )
-                    continue
-
-            experiments.append(exp)
-    return experiments
+        pairs.append((entry.name, csvs[0]))
+    return pairs
 
 
-# --- Top-level orchestration ---------------------------------------------
+def load_dataset(csv_path: pathlib.Path, dataset_name: str):
+    """Load a CSV, split features/labels, one-hot encode the features.
+
+    The target column is assumed to be the last CSV column (true for every
+    dataset under ``DPG/datasets/``). Columns listed in
+    ``DROP_COLUMNS_OVERRIDES`` (IDs / near-unique free text) are dropped
+    before encoding. The delimiter (``,`` vs ``;``) is auto-detected since
+    datasets in this repo use both.
+    """
+    df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
+
+    drop_cols = [c for c in DROP_COLUMNS_OVERRIDES.get(dataset_name, []) if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    features = df.iloc[:, :-1]
+    labels = df.iloc[:, -1]
+
+    features_enc = pd.get_dummies(features, drop_first=False)
+    features_enc = features_enc.replace([np.inf, -np.inf], np.nan).fillna(features_enc.mean())
+    features_enc = np.round(features_enc, 3)
+    feature_names = list(features_enc.columns)
+    return features_enc, labels, feature_names
+
+
+def train_cv(model, X, y, n_splits: int = N_SPLITS, random_state: int = RANDOM_STATE):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    accs, f1s = [], []
+    last_train = None
+    for tr, te in kf.split(X):
+        X_tr, X_te = X.iloc[tr], X.iloc[te]
+        y_tr, y_te = y.iloc[tr], y.iloc[te]
+        model.fit(X_tr, y_tr)
+        y_pred = model.predict(X_te)
+        accs.append(accuracy_score(y_te, y_pred))
+        f1s.append(f1_score(y_te, y_pred, average="weighted"))
+        last_train = (X_tr, y_tr)
+    return float(np.mean(accs)), float(np.mean(f1s)), last_train
+
+
+# ---------------------------------------------------------------------------
+# Structure JSON persistence (needed as input for the grouping scripts)
+# ---------------------------------------------------------------------------
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def save_dpg_structure_json(explanation, out_path: pathlib.Path, run_id: str,
+                             feature_names, target_names) -> None:
+    graph_data = json_graph.node_link_data(explanation.graph)
+    labeled_nodes = [{"id": nid, "label": lab} for nid, lab in explanation.nodes]
+    payload = {
+        "run_id": run_id,
+        "feature_names": [str(n) for n in feature_names],
+        "target_names": [str(n) for n in target_names],
+        "community_threshold": explanation.community_threshold,
+        "nodes": labeled_nodes,
+        "graph": graph_data,
+    }
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset DPG config (perc_var override)
+# ---------------------------------------------------------------------------
+
+
+def resolve_config_path(
+    dataset_name: str, base_config_path: pathlib.Path, staging_dir: pathlib.Path
+) -> pathlib.Path:
+    """Return the config.yaml path to use for this dataset's DPG run.
+
+    Datasets in ``PERC_VAR_OVERRIDES`` get a copy of the base config with
+    ``dpg.default.perc_var`` overridden, written into ``staging_dir`` so it
+    travels alongside that dataset's other artifacts. Everything else just
+    uses ``base_config_path`` unchanged.
+    """
+    override = PERC_VAR_OVERRIDES.get(dataset_name)
+    if override is None:
+        return base_config_path
+    with open(base_config_path, "r", encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+    cfg.setdefault("dpg", {}).setdefault("default", {})["perc_var"] = float(override)
+    out_path = staging_dir / "config.yaml"
+    with open(out_path, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset run
+# ---------------------------------------------------------------------------
+
+
+def run_one_dataset(
+    dataset_name: str,
+    csv_path: pathlib.Path,
+    output_root: pathlib.Path,
+    visualization_config: dict,
+    config_path: pathlib.Path,
+) -> dict:
+    """Produce the basic DPG run for one dataset, then the three grouped
+    variants, writing everything under ``output_root/<dataset_name>/``.
+    """
+    dataset_out = output_root / dataset_name
+    run_id = dataset_name
+
+    # The basic run is staged in a folder named exactly ``run_id`` because
+    # the grouping scripts' ``_process_subdir`` derives the run id (and the
+    # structure/metrics filenames it looks for) from the subdir's basename.
+    # Once grouping is done, this staging folder is renamed to "BASIC DPG".
+    staging_dir = dataset_out / run_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    X, y, feature_names = load_dataset(csv_path, dataset_name)
+
+    model = RandomForestClassifier(n_estimators=NUM_TREES, random_state=RANDOM_STATE)
+    acc, f1, (X_train, y_train) = train_cv(model, X, y)
+
+    effective_config_path = resolve_config_path(dataset_name, config_path, staging_dir)
+
+    target_names = np.unique(y).astype(str).tolist()
+    explainer = DPGExplainer(
+        model=model,
+        feature_names=feature_names,
+        target_names=target_names,
+        config_file=str(effective_config_path),
+    )
+    explanation = explainer.explain_global(
+        X_train.values,
+        communities=True,
+        community_threshold=COMMUNITY_THRESHOLD,
+    )
+
+    save_dpg_structure_json(
+        explanation,
+        staging_dir / f"{run_id}_dpg_structure.json",
+        run_id,
+        feature_names,
+        target_names,
+    )
+    with open(staging_dir / f"{run_id}_dpg_class_boundaries.txt", "w") as f:
+        for key, value in explanation.class_boundaries.items():
+            f.write(f"{key}: {value}\n")
+    explanation.node_metrics.to_csv(
+        staging_dir / f"{run_id}_node_metrics.csv", encoding="utf-8"
+    )
+    explanation.edge_metrics.to_csv(
+        staging_dir / f"{run_id}_edge_metrics.csv", encoding="utf-8"
+    )
+    if explanation.communities is not None:
+        GraphMetrics.communities_to_csv(
+            explanation.communities,
+            str(staging_dir / f"{run_id}_dpg_communities.txt"),
+        )
+
+    run_name = f"{run_id}_DPG"
+    explainer.plot(
+        run_name,
+        explanation=explanation,
+        save_dir=str(staging_dir),
+        class_flag=False,
+        export_pdf=True,
+        show=False,
+    )
+    explainer.plot_communities(
+        run_name,
+        explanation=explanation,
+        save_dir=str(staging_dir),
+        class_flag=True,
+        export_pdf=True,
+        show=False,
+    )
+
+    n_nodes = len(explanation.node_metrics)
+    n_edges = len(explanation.edge_metrics)
+    n_comms = 0
+    if explanation.communities and "Clusters" in explanation.communities:
+        n_comms = sum(
+            1 for k, v in explanation.communities["Clusters"].items()
+            if k != "Ambiguous" and v
+        )
+
+    # --- Three grouping passes, each reading the staged structure JSON ---
+    for module_name, label in GROUPING_MODULES:
+        out_dir = dataset_out / label
+        out_dir.mkdir(parents=True, exist_ok=True)
+        module = importlib.import_module(module_name)
+        try:
+            out_png = module._process_subdir(
+                str(staging_dir), str(out_dir), visualization_config
+            )
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            print(f"  [err]  {module_name} on {dataset_name}: {exc}")
+            continue
+        if out_png is None:
+            print(f"  [skip] {module_name} on {dataset_name}: no structure JSON")
+        else:
+            print(f"  [ok]   {module_name} -> {out_dir}")
+
+    # --- Move the staging folder into its final "BASIC DPG" name ---------
+    basic_dir = dataset_out / BASIC_LABEL
+    if basic_dir.exists():
+        shutil.rmtree(basic_dir)
+    shutil.move(str(staging_dir), str(basic_dir))
+
+    artifacts = [p for p in dataset_out.rglob("*") if p.is_file()]
+
+    return {
+        "dataset": dataset_name,
+        "accuracy": acc,
+        "f1": f1,
+        "n_nodes": n_nodes,
+        "n_edges": n_edges,
+        "n_communities": n_comms,
+        "output_dir": dataset_out,
+        "artifacts": artifacts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
 
 
 def generate_report(
-    experiments: List[Experiment],
-    results: Dict[str, List[Experiment]],
+    results: Dict[str, list],
     total_elapsed: float,
     output_path: pathlib.Path,
 ) -> None:
-    """Write a markdown summary report mirroring ``run_all_experiments.py``."""
     lines: List[str] = []
-    lines.append("# Categorical Features Run Report")
+    lines.append("# Categorical DPG Batch Run Report")
     lines.append("")
     lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append(f"**Total Duration:** {total_elapsed:.1f}s ({total_elapsed/60:.1f} minutes)")
     lines.append(f"**W&B project:** `{WANDB_PROJECT}`")
-    lines.append(f"**W&B entity:**  `{WANDB_ENTITY}`")
+    lines.append(f"**W&B entity:**  `{WANDB_ENTITY or '(account default)'}`")
     lines.append(f"**W&B group:**   `{WANDB_GROUP}`")
     lines.append("")
 
     lines.append("## Summary")
     lines.append("")
-    lines.append(f"- OK  **Successful:** {len(results['success'])}")
-    lines.append(f"- ERR **Failed:**     {len(results['failed'])}")
-    lines.append(f"- SKIP **Skipped:**   {len(results['skipped'])}")
+    lines.append(f"- Successful: {len(results['success'])}")
+    lines.append(f"- Failed:     {len(results['failed'])}")
     lines.append("")
 
     if results["success"]:
         lines.append("## Successful Runs")
         lines.append("")
-        for exp in sorted(results["success"], key=lambda e: e.key):
-            lines.append(f"- `{exp.key}` -> `{exp.output_dir}`")
+        lines.append("| Dataset | Accuracy | F1 | Nodes | Edges | Communities | Output |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for info in sorted(results["success"], key=lambda i: i["dataset"]):
+            lines.append(
+                f"| {info['dataset']} | {info['accuracy']:.3f} | {info['f1']:.3f} | "
+                f"{info['n_nodes']} | {info['n_edges']} | {info['n_communities']} | "
+                f"`{info['output_dir']}` |"
+            )
         lines.append("")
+
     if results["failed"]:
         lines.append("## Failed Runs")
         lines.append("")
-        for exp in sorted(results["failed"], key=lambda e: e.key):
-            lines.append(f"- `{exp.key}`")
+        for info in sorted(results["failed"], key=lambda i: i["dataset"]):
+            lines.append(f"- `{info['dataset']}`: {info.get('error', 'unknown error')}")
         lines.append("")
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def main(argv: Optional[str[str]] = None) -> int:
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -613,64 +521,36 @@ def main(argv: Optional[str[str]] = None) -> int:
     parser.add_argument(
         "--datasets-dir",
         type=pathlib.Path,
-        default=REPO_ROOT / "datasets",
+        default=DEFAULT_DATASETS_DIR,
         help="Root containing one subdir per dataset (default: DPG/datasets).",
     )
     parser.add_argument(
         "--datasets", nargs="+", default=None,
-        help="Restrict to a subset of dataset subdir names (default: all).",
-    )
-    parser.add_argument(
-        "--grouping-dir",
-        type=pathlib.Path,
-        default=GROUPING_DIR,
-        help="Directory containing the grouping scripts.",
-    )
-    parser.add_argument(
-        "--scripts", nargs="+", default=None,
-        help="Restrict to a subset of grouping scripts (default: all known).",
-    )
-    parser.add_argument(
-        "--results-roots",
-        type=pathlib.Path,
-        nargs="+",
-        default=list(DEFAULT_RESULTS_ROOTS),
-        help="One or more directories of DPG subdirs to mine for inputs.",
+        help="Restrict to a subset of dataset subdir names (default: all, except dummy_dataset).",
     )
     parser.add_argument(
         "--output-root",
         type=pathlib.Path,
-        default=None,
-        help=(
-            "Unversioned root for rendered PNGs + JSONs. "
-            f"Defaults to a timestamped subdir under {DEFAULT_OUTPUT_ROOT}."
-        ),
-    )
-    parser.add_argument(
-        "--skip-existing", action="store_true",
-        help="Skip (dataset, script) combos whose status file is FINISHED.",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Print what would run; don't actually invoke grouping scripts.",
-    )
-    parser.add_argument(
-        "--offline", action="store_true",
-        help="Run wandb in offline mode (sync later with `wandb sync`).",
-    )
-    parser.add_argument(
-        "--parallel", type=int, default=1, metavar="N",
-        help="Run up to N experiments concurrently (default: sequential).",
-    )
-    parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Cap the number of experiments (after dataset/script filtering).",
+        default=DEFAULT_OUTPUT_ROOT,
+        help="Root under which each dataset gets its own subfolder (default: DPG/outputs/categorical).",
     )
     parser.add_argument(
         "--config",
         type=pathlib.Path,
-        default=REPO_ROOT / "config.yaml",
-        help="DPG visualisation config YAML (passed to each grouping script).",
+        default=DEFAULT_CONFIG_PATH,
+        help="DPG config YAML (perc_var/decimal_threshold + visualization styling).",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Cap the number of datasets processed.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print what would run; don't actually train models or invoke grouping scripts.",
+    )
+    parser.add_argument(
+        "--offline", action="store_true",
+        help="Run wandb in offline mode (sync later with `wandb sync`).",
     )
     parser.add_argument(
         "--no-wandb", action="store_true",
@@ -678,168 +558,116 @@ def main(argv: Optional[str[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # --- Discovery ------------------------------------------------------
-    datasets = args.datasets if args.datasets else discover_datasets(args.datasets_dir)
-    if args.datasets and not datasets:
+    if not args.config.exists():
+        print(f"ERROR: config file not found: {args.config}")
+        return 1
+    with open(args.config, "r", encoding="utf-8") as fh:
+        visualization_config = yaml.safe_load(fh)
+
+    pairs = discover_dataset_csvs(args.datasets_dir, args.datasets)
+    if args.datasets and not pairs:
         print(f"ERROR: none of the requested datasets exist under {args.datasets_dir}")
         return 1
-    scripts = args.scripts if args.scripts else discover_scripts(args.grouping_dir)
-    if not scripts:
-        print(f"ERROR: no known grouping scripts found under {args.grouping_dir}")
+    if not pairs:
+        print(f"ERROR: no dataset CSVs found under {args.datasets_dir}")
         return 1
-    dataset_matches = build_dataset_matches(
-        datasets, args.datasets_dir, args.results_roots
-    )
+    if args.limit is not None:
+        pairs = pairs[: args.limit]
 
-    # --- Output root (timestamped if not provided) -----------------------
-    if args.output_root is None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_root = DEFAULT_OUTPUT_ROOT / ts
-    else:
-        output_root = args.output_root
+    output_root = args.output_root
     output_root.mkdir(parents=True, exist_ok=True)
 
-    # --- Build the experiment list --------------------------------------
-    experiments = build_experiments(
-        dataset_matches, scripts, output_root, args.skip_existing
-    )
-    if args.limit is not None:
-        experiments = experiments[: args.limit]
-
-    if not experiments:
-        print(
-            f"{C.YELLOW}No experiments to run. "
-            f"(datasets={len(datasets)}, matches={len(dataset_matches)}, "
-            f"scripts={len(scripts)}){C.RESET}"
-        )
-        return 0
-
-    # --- Banner ---------------------------------------------------------
     print("=" * 64)
-    print(f"{C.BOLD}CATEGORICAL FEATURES BATCH RUNNER{C.RESET}")
+    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes)")
     print("=" * 64)
-    print(f"Start time:          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Datasets discovered: {len(datasets)}")
-    print(f"Datasets w/ matches: {len(dataset_matches)}")
-    print(f"Grouping scripts:    {len(scripts)}")
-    print(f"Experiments to run:  {len(experiments)}")
-    print(f"Output root:         {output_root}")
-    print(f"W&B project:         {WANDB_PROJECT}  (entity: {WANDB_ENTITY})")
-    print(f"W&B group:           {WANDB_GROUP}")
-    print(f"Parallel workers:    {args.parallel}")
-    print(f"Dry run:             {args.dry_run}")
+    print(f"Start time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Datasets to run:  {len(pairs)}  ({', '.join(name for name, _ in pairs)})")
+    print(f"Output root:      {output_root}")
+    print(f"Config:           {args.config}")
+    print(f"Dry run:          {args.dry_run}")
+    print(f"W&B project:      {WANDB_PROJECT}  (entity: {WANDB_ENTITY or '(account default)'})")
     print("=" * 64)
 
-    if not args.config.exists():
-        print(f"ERROR: visualisation config not found: {args.config}")
-        return 1
-    visualization_config = _load_visualization_config(args.config)
-
-    # --- Run ------------------------------------------------------------
-    total_start = time.time()
-    results: Dict[str, List[Experiment]] = {
-        "success": [], "failed": [], "skipped": [],
-    }
     use_wandb = WANDB_AVAILABLE and not args.no_wandb
     if not use_wandb and not args.no_wandb:
-        print(f"{C.YELLOW}wandb not installed; running without W&B logging.{C.RESET}")
+        print("wandb not installed; running without W&B logging.")
 
-    for idx, exp in enumerate(experiments, 1):
-        n_subs = sum(len(m.matching_subdirs) for m in exp.matches)
-        print(
-            f"\n[{idx}/{len(experiments)}] {C.BOLD}{exp.key}{C.RESET} "
-            f"({n_subs} DPG subdir(s))"
-        )
+    results: Dict[str, list] = {"success": [], "failed": []}
+    total_start = time.time()
+
+    for idx, (dataset_name, csv_path) in enumerate(pairs, 1):
+        print(f"\n[{idx}/{len(pairs)}] {dataset_name}  ({csv_path})")
         print("-" * 40)
 
-        if not exp.matches:
-            print(f"  {C.YELLOW}[skip]{C.RESET} no matching DPG subdirs for {exp.dataset}")
-            results["skipped"].append(exp)
+        if args.dry_run:
+            print(f"  [dry-run] would train + explain + group {dataset_name}")
+            results["success"].append({"dataset": dataset_name})
             continue
 
-        # WandB: one run per experiment. Best-effort: if init fails, log
-        # the artifact paths locally and keep going.
         run = None
         if use_wandb:
             try:
-                run = wandb_init_for_experiment(exp, args.offline)
+                run = wandb_init_for_dataset(dataset_name, csv_path, args.offline)
             except Exception as exc:  # noqa: BLE001
-                print(f"  {C.YELLOW}[wandb] init failed: {exc}; continuing offline{C.RESET}")
+                print(f"  [wandb] init failed: {exc}; continuing without wandb")
                 run = None
 
         try:
-            ok, artifacts = run_one_experiment(
-                exp, visualization_config, args.offline, dry_run=args.dry_run
+            info = run_one_dataset(
+                dataset_name, csv_path, output_root, visualization_config, args.config
             )
-        finally:
+        except Exception as exc:  # noqa: BLE001
+            print(f"  FAIL {dataset_name}: {exc}")
+            results["failed"].append({"dataset": dataset_name, "error": str(exc)})
             if run is not None:
-                try:
-                    wandb_log_artifacts(run, artifacts)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"  {C.YELLOW}[wandb] log failed: {exc}{C.RESET}")
                 try:
                     run.finish()
                 except Exception:
                     pass
-
-        if args.dry_run:
-            results["success"].append(exp)
             continue
-        if ok:
-            print(
-                f"  {C.GREEN}OK{C.RESET} -> {exp.output_dir} "
-                f"({len(artifacts)} artifact(s))"
-            )
-            results["success"].append(exp)
+
+        print(
+            f"  OK -> {info['output_dir']}  "
+            f"acc={info['accuracy']:.3f}  f1={info['f1']:.3f}  "
+            f"nodes={info['n_nodes']}  edges={info['n_edges']}  comms={info['n_communities']}"
+        )
+        results["success"].append(info)
+
+        if run is not None:
             try:
-                write_status(
-                    exp.dataset,
-                    f"cat__{SCRIPT_REGISTRY[exp.script_name]['label']}",
-                    PersistentStatus.FINISHED,
-                    pathlib.Path(output_root),
-                    pid=os.getpid(),
-                    start_time=total_start,
-                    end_time=time.time(),
-                )
-            except Exception:
-                pass
-        else:
-            print(f"  {C.RED}FAIL{C.RESET} {exp.key}")
-            results["failed"].append(exp)
+                wandb_log_artifacts(run, info["artifacts"])
+                run.log({
+                    "accuracy": info["accuracy"],
+                    "f1": info["f1"],
+                    "n_nodes": info["n_nodes"],
+                    "n_edges": info["n_edges"],
+                    "n_communities": info["n_communities"],
+                })
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [wandb] log failed: {exc}")
             try:
-                write_status(
-                    exp.dataset,
-                    f"cat__{SCRIPT_REGISTRY[exp.script_name]['label']}",
-                    PersistentStatus.ERROR,
-                    pathlib.Path(output_root),
-                    pid=os.getpid(),
-                    start_time=total_start,
-                    end_time=time.time(),
-                    error_message="see run output",
-                )
+                run.finish()
             except Exception:
                 pass
 
     total_elapsed = time.time() - total_start
 
-    # --- Summary --------------------------------------------------------
     print("\n" + "=" * 64)
-    print(f"{C.BOLD}SUMMARY{C.RESET}")
+    print("SUMMARY")
     print("=" * 64)
-    print(f"End time:        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Total time:      {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
-    print(f"{C.GREEN}Successful:{C.RESET}      {len(results['success'])}")
-    print(f"{C.RED}Failed:{C.RESET}          {len(results['failed'])}")
-    print(f"{C.YELLOW}Skipped:{C.RESET}         {len(results['skipped'])}")
+    print(f"End time:    {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total time:  {total_elapsed:.1f}s ({total_elapsed/60:.1f} min)")
+    print(f"Successful:  {len(results['success'])}")
+    print(f"Failed:      {len(results['failed'])}")
 
     if results["failed"]:
-        print("\nFailed experiments:")
-        for exp in results["failed"]:
-            print(f"  - {exp.key}")
+        print("\nFailed datasets:")
+        for info in results["failed"]:
+            print(f"  - {info['dataset']}: {info.get('error', 'unknown error')}")
 
     if not args.dry_run:
         report_path = output_root / "report.md"
-        generate_report(experiments, results, total_elapsed, report_path)
+        generate_report(results, total_elapsed, report_path)
         print(f"\nReport saved to {report_path}")
         print(f"Artifacts under {output_root}")
 
