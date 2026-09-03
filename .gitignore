@@ -16,7 +16,7 @@ ENV/
 *.jpg
 custom.csv
 dataset.csv
-datasets/
+#datasets/
 *.txt
 !docs/requirements.txt
 
