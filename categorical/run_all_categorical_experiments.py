@@ -22,13 +22,16 @@ script:
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
-other dataset). Feature columns are one-hot encoded as-is (same as
-``gridsearch_dpg.py``), except columns listed in ``DROP_COLUMNS_OVERRIDES``
+other dataset). Rows with a missing target value are dropped (e.g.
+rain_australia has 3267 rows with no ``RainTomorrow`` value -- RandomForest
+can't train on a NaN label). Feature columns are one-hot encoded as-is (same
+as ``gridsearch_dpg.py``), except columns listed in ``DROP_COLUMNS_OVERRIDES``
 -- currently titanic's ``PassengerId``, ``Name``, ``Ticket`` and ``Cabin``,
 which are IDs / near-unique free text that would otherwise explode into
 hundreds of one-hot columns. Datasets listed in ``PERC_VAR_OVERRIDES`` use a
-smaller ``perc_var`` than ``config.yaml``'s default -- titanic's RandomForest
-otherwise produces zero surviving decision paths at the default 0.01.
+smaller ``perc_var`` than ``config.yaml``'s default -- titanic's and
+students_dropout_success's RandomForests otherwise produce zero surviving
+decision paths at the default 0.01.
 
 Optionally logs everything to Weights & Biases (project ``dpg-categorical``,
 same entity as the counterfactual pipeline), one run per dataset.
@@ -119,11 +122,12 @@ DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
 # Per-dataset perc_var override (see config.yaml's ``dpg.default.perc_var``).
 # perc_var is a *minimum* fraction of paths a pattern must appear in to be
 # kept, so a smaller value keeps MORE paths. The repo default (0.01) leaves
-# titanic with zero surviving paths (its RandomForest produces too many
-# distinct root-to-leaf paths for any one to clear a 1% bar), so it needs a
-# smaller perc_var than the default.
+# these datasets with zero surviving paths -- their RandomForests produce too
+# many distinct root-to-leaf paths for any one to clear a 1% bar -- so they
+# need a smaller perc_var than the default.
 PERC_VAR_OVERRIDES: Dict[str, float] = {
     "titanic": 0.005,
+    "students_dropout_success": 0.005,
 }
 
 NUM_TREES = 10
@@ -246,6 +250,14 @@ def load_dataset(csv_path: pathlib.Path, dataset_name: str):
     drop_cols = [c for c in DROP_COLUMNS_OVERRIDES.get(dataset_name, []) if c in df.columns]
     if drop_cols:
         df = df.drop(columns=drop_cols)
+
+    # Rows with a missing target can't be used for supervised training (e.g.
+    # rain_australia has 3267 rows with no RainTomorrow value) -- drop them.
+    target_col = df.columns[-1]
+    n_before = len(df)
+    df = df.dropna(subset=[target_col]).reset_index(drop=True)
+    if len(df) != n_before:
+        print(f"  [info] {dataset_name}: dropped {n_before - len(df)} row(s) with missing target")
 
     features = df.iloc[:, :-1]
     labels = df.iloc[:, -1]
