@@ -128,6 +128,10 @@ DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
 PERC_VAR_OVERRIDES: Dict[str, float] = {
     "titanic": 0.005,
     "students_dropout_success": 0.005,
+    # Big / high-cardinality datasets produce so many distinct root-to-leaf
+    # paths that no single pattern clears even the 0.005 bar.
+    "rain_australia": 0.001,
+    "health_insurance": 0.001,
 }
 
 NUM_TREES = 10
