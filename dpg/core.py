@@ -136,15 +136,140 @@ class DecisionPredicateGraph:
         print("Model Params: ", self.model.get_params())
         print("*****************************************************************")
 
-        # Extract decision paths (parallel or sequential)
+        # Extract decision paths (parallel or sequential).
+        #
+        # ``n_jobs=-1`` / ``n_jobs > 1`` uses joblib's loky backend, which
+        # cloudpickles each task to a worker process. On some host
+        # configurations (notably when loky tries to auto-memmap the captured
+        # sklearn model, or when the default memmap ``temp_folder`` lives on
+        # a read-only filesystem), the per-sample call fails with a
+        # misleading ``Could not pickle the task to send it to the workers``
+        # or ``OSError: [Errno 28] No space left on device`` error.
+        #
+        # To stay robust:
+        #   1. Route joblib's temp folder to a path that's guaranteed to be
+        #      writable (``$JOBLIB_TEMP_FOLDER`` if set, otherwise
+        #      ``<repo>/.joblib_tmp``).
+        #   2. For parallel mode, chunk the work over fixed-size batches so
+        #      the captured closure has a small, pickle-friendly argument
+        #      list (chunk ndarray + estimator internals) -- not the whole
+        #      fitted ensemble on every iteration.
+        #   3. If parallel still fails, fall back to a sequential per-sample
+        #      loop so extraction always completes (slower, but correct).
+        from joblib import parallel_backend  # local import keeps top-level clean
+        import os as _os
+        import pathlib as _pathlib
+        import numpy as _np
+
+        joblib_temp = _os.environ.get("JOBLIB_TEMP_FOLDER")
+        if not joblib_temp:
+            _default_tmp = _pathlib.Path(__file__).resolve().parent.parent / ".joblib_tmp"
+            _default_tmp.mkdir(parents=True, exist_ok=True)
+            joblib_temp = str(_default_tmp)
+
+        X_arr = _np.ascontiguousarray(X_train)
+        is_regressor = isinstance(
+            self.model,
+            (RandomForestRegressor, ExtraTreesRegressor, AdaBoostRegressor),
+        )
+
+        def _run_chunk(start: int, batch: _np.ndarray) -> list:
+            """Module-level worker -- no closure over ``self``.
+
+            Processes a contiguous slice of ``X_train`` rows and returns a
+            flat list of 2-element ``[prefix, event]`` pairs. Receives the
+            estimator internals as plain lists, so cloudpickle/loky never
+            tries to memmap the fitted sklearn model.
+            """
+            out: list = []
+            for offset in range(len(batch)):
+                case_id = start + offset
+                sample = batch[offset]
+                sample = sample.reshape(-1)
+                for i in range(len(_children_left_list)):
+                    children_left = _children_left_list[i]
+                    children_right = _children_right_list[i]
+                    feature = _feature_list[i]
+                    threshold = _threshold_list[i]
+                    value = _value_list[i]
+                    tree_prefix = f"sample{case_id}_dt{i}"
+                    node_index = 0
+                    while True:
+                        left = int(children_left[node_index])
+                        right = int(children_right[node_index])
+                        if left == right:
+                            if _is_reg:
+                                pred = round(float(value[node_index][0][0]), 2)
+                                out.append([tree_prefix, f"Pred {pred}"])
+                            else:
+                                pred_class = int(value[node_index].argmax())
+                                if _target_names is not None:
+                                    pred_class = _target_names[pred_class]
+                                out.append([tree_prefix, f"Class {pred_class}"])
+                            break
+                        feature_index = int(feature[node_index])
+                        thresh = round(float(threshold[node_index]), _decimal_threshold)
+                        fname = _feature_names[feature_index]
+                        sample_val = sample[feature_index]
+                        if sample_val <= thresh:
+                            condition = f"{fname} <= {thresh}"
+                            node_index = left
+                        else:
+                            condition = f"{fname} > {thresh}"
+                            node_index = right
+                        out.append([tree_prefix, condition])
+            return out
+
+        # Pre-extract estimator internals -- small, cheap-to-pickle Python
+        # lists of numpy arrays, so loky never needs to memmap the model.
+        _children_left_list = [t.tree_.children_left for t in self.model.estimators_]
+        _children_right_list = [t.tree_.children_right for t in self.model.estimators_]
+        _feature_list = [t.tree_.feature for t in self.model.estimators_]
+        _threshold_list = [t.tree_.threshold for t in self.model.estimators_]
+        _value_list = [t.tree_.value for t in self.model.estimators_]
+        _is_reg = is_regressor
+        _target_names = self.target_names
+        _feature_names = list(self.feature_names)
+        _decimal_threshold = self.decimal_threshold
+
         if self.n_jobs == 1:
-            log = Parallel(n_jobs=self.n_jobs)(
-                delayed(self.tracing_ensemble)(i, sample) for i, sample in tqdm(list(enumerate(X_train)), total=len(X_train))
-            )
+            log = [
+                item
+                for sublist in (
+                    self.tracing_ensemble(i, sample)
+                    for i, sample in enumerate(X_arr)
+                )
+                for item in sublist
+            ]
         else:
-            log = Parallel(n_jobs=self.n_jobs)(
-                delayed(self.tracing_ensemble_parallel)(i, sample) for i, sample in tqdm(list(enumerate(X_train)), total=len(X_train))
-            )
+            try:
+                # Chunk the rows. 4k rows/chunk gives good parallelism on
+                # big datasets without making each task huge.
+                chunk_size = int(_os.environ.get("DPG_CHUNK_SIZE", "4096"))
+                n = len(X_arr)
+                chunks = [
+                    (start, X_arr[start : start + chunk_size])
+                    for start in range(0, n, chunk_size)
+                ]
+                with parallel_backend("loky", temp_folder=joblib_temp):
+                    log = Parallel(n_jobs=self.n_jobs)(
+                        delayed(_run_chunk)(start, batch)
+                        for start, batch in tqdm(chunks, desc="DPG chunks")
+                    )
+            except Exception as _exc:
+                print(
+                    f"[DPG] Parallel path extraction failed "
+                    f"({type(_exc).__name__}: {_exc}); "
+                    f"falling back to sequential n_jobs=1."
+                )
+                log = [
+                    item
+                    for sublist in (
+                        self.tracing_ensemble(i, sample)
+                        for i, sample in enumerate(X_arr)
+                    )
+                    for item in sublist
+                ]
 
         # Process extracted paths
         log = [item for sublist in log for item in sublist]
