@@ -109,6 +109,80 @@ def build_eval_row(raw_row: pd.Series, encoded_row: pd.Series) -> pd.Series:
     return combined[~combined.index.duplicated(keep="last")]
 
 
+def load_eval_rows(
+    csv_path: str,
+    drop_columns: Optional[Sequence[str]] = None,
+    n_samples: Optional[int] = 200,
+    random_state: int = 27,
+) -> List[pd.Series]:
+    """Load a dataset CSV straight into rows ready for graph walking.
+
+    Applies the same preprocessing the training pipeline uses (delimiter
+    sniffing, dropped ID/free-text columns, rows with a missing target
+    removed, one-hot encoding, rounding), then pairs each raw row with
+    its encoded counterpart via ``build_eval_row``.
+
+    Note these rows do NOT have to be the same rows the DPG was built
+    from. The decision/explanation comparisons are graph-against-graph:
+    both variants are walked with identical inputs, so any representative
+    sample of the dataset answers the question "do these two graphs
+    behave the same". Only fidelity-against-the-model would require the
+    original split, and that needs the trained model anyway.
+
+    ``n_samples`` draws a reproducible random subset (all rows if None or
+    if the dataset is smaller).
+    """
+    df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
+
+    if drop_columns:
+        present = [c for c in drop_columns if c in df.columns]
+        if present:
+            df = df.drop(columns=present)
+
+    target_col = df.columns[-1]
+    df = df.dropna(subset=[target_col]).reset_index(drop=True)
+
+    features_raw = df.iloc[:, :-1]
+    features_enc = pd.get_dummies(features_raw, drop_first=False)
+    features_enc = features_enc.replace([np.inf, -np.inf], np.nan).fillna(features_enc.mean())
+    features_enc = np.round(features_enc, 3)
+
+    if n_samples is not None and len(features_raw) > n_samples:
+        index = features_raw.sample(n=n_samples, random_state=random_state).index
+    else:
+        index = features_raw.index
+
+    return [build_eval_row(features_raw.loc[i], features_enc.loc[i]) for i in index]
+
+
+def compare_variants(
+    graph_a: nx.DiGraph,
+    nodes_a: Sequence[Tuple[str, str]],
+    graph_b: nx.DiGraph,
+    nodes_b: Sequence[Tuple[str, str]],
+    eval_rows: Sequence[pd.Series],
+) -> Dict[str, object]:
+    """Full graph-against-graph comparison of two DPG variants.
+
+    Walks both graphs over the same rows and returns the decision-level
+    and explanation-level numbers together:
+    ``decision_agreement``, ``explanation_agreement``,
+    ``explanation_overlap``, ``explanation_partial``.
+
+    No model is needed -- this compares two graphs to each other, not
+    either graph to the RandomForest.
+    """
+    preds_a = dpg_predictions(graph_a, nodes_a, eval_rows)
+    preds_b = dpg_predictions(graph_b, nodes_b, eval_rows)
+    routes_a = [dpg_routes(graph_a, nodes_a, row) for row in eval_rows]
+    routes_b = [dpg_routes(graph_b, nodes_b, row) for row in eval_rows]
+
+    result: Dict[str, object] = {}
+    result.update(compute_agreement(preds_a, preds_b))
+    result.update(compute_path_agreement(routes_a, routes_b))
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Predicate evaluation
 # ---------------------------------------------------------------------------
