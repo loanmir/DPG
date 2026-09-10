@@ -27,6 +27,24 @@ For each dataset folder under ``DPG/datasets/`` (skipping ``dummy_dataset``):
                                             no orphan nodes)
        5. Sum of predicate characters      (sum of len(label) including
                                             ``Class X`` sinks)
+2b. Compute the graph-vs-graph equivalence metrics from
+   ``dpg_equivalence.py``, comparing every variant against ``BASIC DPG``:
+
+       6. decision_agreement     -- same predicted class on the same rows
+       7. explanation_agreement  -- same conditions tested along the way
+       8. explanation_overlap    -- partial credit for partly-matching routes
+       9. explanation_partial    -- rows where route enumeration hit its cap
+
+   These walk both graphs with real data rows, so they need the dataset
+   CSV on local disk (``DPG/datasets/<dataset>/``). They do NOT need the
+   trained RandomForest -- the comparison is graph against graph, not
+   graph against model, which is why this script can compute them
+   despite never training anything. Datasets with no local CSV simply
+   get empty equivalence columns. Use ``--no-equivalence`` to skip.
+
+   Note ``decision_agreement`` is the weaker of the pair: a graph with a
+   flipped predicate can change the reasoning on most rows while still
+   scoring 1.000 on decisions. Read ``explanation_agreement`` alongside it.
 3. Log a ``wandb.Table`` to the same run with one row per variant.
 4. Print a console summary and write a markdown report to
    ``DPG/outputs/categorical/metrics_report.md`` (the latter always,
@@ -61,6 +79,18 @@ REPO_ROOT = SCRIPT_DIR.parent  # DPG/
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from categorical import dpg_equivalence as eq  # noqa: E402
+
+# Per-dataset columns dropped before one-hot encoding (IDs / near-unique
+# free text). Imported from the experiment runner so the evaluation rows
+# are encoded the same way the graphs were built. That module pulls in
+# matplotlib/sklearn/dpg, so a failure to import it must not take the
+# metrics run down -- equivalence just falls back to no dropped columns.
+try:
+    from categorical.run_all_categorical_experiments import DROP_COLUMNS_OVERRIDES
+except Exception:  # noqa: BLE001 - optional, see above
+    DROP_COLUMNS_OVERRIDES = {}
 
 # --- Constants ------------------------------------------------------------
 
@@ -366,6 +396,10 @@ def compute_dataset_metrics_from_run(
             metrics = compute_metrics(structure)
             metrics["_json_path"] = str(json_path)
             metrics["_artifact_name"] = art.name
+            # Kept so the equivalence pass can rebuild this variant's
+            # graph without downloading it a second time. Stripped before
+            # the metrics reach the table/report.
+            metrics["_structure"] = structure
             out[variant_label] = metrics
         except Exception as exc:  # noqa: BLE001
             out[variant_label] = {
@@ -373,6 +407,108 @@ def compute_dataset_metrics_from_run(
                 "_error": f"{type(exc).__name__}: {exc}",
             }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Equivalence metrics (graph vs graph -- no model needed)
+# ---------------------------------------------------------------------------
+
+# The variant every other variant is compared against.
+BASELINE_VARIANT = "BASIC DPG"
+
+EQUIVALENCE_KEYS = (
+    "decision_agreement",
+    "explanation_agreement",
+    "explanation_overlap",
+    "explanation_partial",
+)
+
+
+def find_dataset_csv(datasets_dir: pathlib.Path, dataset_name: str) -> Optional[pathlib.Path]:
+    """Locate a dataset's CSV on local disk, or None if it isn't there.
+
+    The structure JSONs come from W&B, but the equivalence metrics need
+    real rows to walk the graphs with, and those only exist locally.
+    """
+    folder = datasets_dir / dataset_name
+    if not folder.is_dir():
+        return None
+    csvs = sorted(folder.glob("*.csv"))
+    return csvs[0] if csvs else None
+
+
+def add_equivalence_metrics(
+    dataset_name: str,
+    variant_metrics: Dict[str, Dict[str, object]],
+    datasets_dir: pathlib.Path,
+    n_samples: int,
+) -> None:
+    """Fill in the equivalence columns for every variant, in place.
+
+    Each variant is compared against ``BASELINE_VARIANT`` by walking both
+    graphs over the same rows. This needs no RandomForest: the comparison
+    is graph-against-graph, which is exactly the question "did grouping
+    change anything". (Fidelity-against-the-model is deliberately not
+    computed here -- it would require the trained model, which this
+    script never has.)
+
+    Missing dataset CSV, missing baseline, or an unparseable graph leaves
+    the columns as None rather than failing the dataset.
+    """
+    baseline = variant_metrics.get(BASELINE_VARIANT)
+    if not baseline or baseline.get("_missing") or "_structure" not in baseline:
+        print(f"  [equiv] no {BASELINE_VARIANT} structure; skipping equivalence")
+        return
+
+    csv_path = find_dataset_csv(datasets_dir, dataset_name)
+    if csv_path is None:
+        print(f"  [equiv] no local CSV under {datasets_dir / dataset_name}; skipping equivalence")
+        return
+
+    try:
+        eval_rows = eq.load_eval_rows(
+            str(csv_path),
+            drop_columns=DROP_COLUMNS_OVERRIDES.get(dataset_name),
+            n_samples=n_samples,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [equiv] could not load rows from {csv_path.name}: {exc}")
+        return
+
+    try:
+        base_graph = eq.structure_to_graph(baseline["_structure"])
+        base_nodes = eq.real_nodes(baseline["_structure"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [equiv] could not rebuild {BASELINE_VARIANT} graph: {exc}")
+        return
+
+    print(f"  [equiv] comparing against {BASELINE_VARIANT} on {len(eval_rows)} rows")
+    for variant_label, metrics in variant_metrics.items():
+        if metrics.get("_missing") or "_structure" not in metrics:
+            continue
+        try:
+            graph = eq.structure_to_graph(metrics["_structure"])
+            nodes = eq.real_nodes(metrics["_structure"])
+            result = eq.compare_variants(
+                base_graph, base_nodes, graph, nodes, eval_rows
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [equiv] {variant_label}: failed ({type(exc).__name__}: {exc})")
+            continue
+        for key in EQUIVALENCE_KEYS:
+            metrics[key] = result.get(key)
+        print(
+            f"  [equiv] {variant_label}: "
+            f"decision={result.get('decision_agreement')}, "
+            f"explanation={result.get('explanation_agreement')}"
+        )
+
+
+def strip_internal_keys(variant_metrics: Dict[str, Dict[str, object]]) -> None:
+    """Drop the cached structure dicts once equivalence is done -- they
+    are large and must not end up in the report or the wandb table."""
+    for metrics in variant_metrics.values():
+        metrics.pop("_structure", None)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +610,10 @@ def _build_summary_rows(
                 metrics.get("unique_nodes"),
                 metrics.get("valid"),
                 metrics.get("predicate_chars"),
+                metrics.get("decision_agreement"),
+                metrics.get("explanation_agreement"),
+                metrics.get("explanation_overlap"),
+                metrics.get("explanation_partial"),
                 run_url,
             ]
         )
@@ -488,6 +628,13 @@ SUMMARY_COLUMNS = [
     "n_unique_nodes",
     "valid",
     "predicate_char_sum",
+    # Graph-vs-graph equivalence, each variant against BASIC DPG.
+    # decision_*  -- same predicted class (weaker: a broken graph can score 1.0)
+    # explanation_* -- same conditions tested along the way (stronger)
+    "decision_agreement",
+    "explanation_agreement",
+    "explanation_overlap",
+    "explanation_partial",
     "wandb_run_url",
 ]
 
@@ -536,6 +683,20 @@ def log_table_to_run(
 # ---------------------------------------------------------------------------
 
 
+def _fmt_ratio(value: object) -> str:
+    """Format an equivalence ratio for display. ``None`` (equivalence not
+    computed for this dataset) and NaN both render as ``-``."""
+    if value is None:
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number != number:  # NaN
+        return "-"
+    return f"{number:.3f}"
+
+
 def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
     """Render the collected metrics as a markdown table per dataset."""
     lines: List[str] = []
@@ -553,37 +714,56 @@ def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
         if run_url:
             lines.append(f"W&B run: <{run_url}>")
         lines.append("")
-        lines.append("| Variant | Nodes | Edges | Unique Nodes | Valid | Predicate Chars |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append(
+            "| Variant | Nodes | Edges | Unique Nodes | Valid | Predicate Chars | "
+            "Decision Agr. | Explanation Agr. | Explanation Overlap |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for variant_label, _short in VARIANTS:
             m = variant_metrics.get(variant_label, {})
             if m.get("_missing"):
-                lines.append(f"| {variant_label} | (missing) | - | - | - | - |")
+                lines.append(f"| {variant_label} | (missing) | - | - | - | - | - | - | - |")
                 continue
             valid = m.get("valid")
             valid_str = "TRUE" if valid is True else "FALSE" if valid is False else str(valid)
             lines.append(
                 f"| {variant_label} | {m.get('nodes')} | {m.get('edges')} | "
-                f"{m.get('unique_nodes')} | {valid_str} | {m.get('predicate_chars')} |"
+                f"{m.get('unique_nodes')} | {valid_str} | {m.get('predicate_chars')} | "
+                f"{_fmt_ratio(m.get('decision_agreement'))} | "
+                f"{_fmt_ratio(m.get('explanation_agreement'))} | "
+                f"{_fmt_ratio(m.get('explanation_overlap'))} |"
             )
         lines.append("")
+
+    lines.append("## Column notes")
+    lines.append("")
+    lines.append("- **Valid** -- structural only: has a class sink, no orphan nodes.")
+    lines.append("- **Decision Agr.** -- same predicted class as `BASIC DPG` on the same rows.")
+    lines.append("  Weaker than it looks: a graph with a flipped predicate can still score 1.000.")
+    lines.append("- **Explanation Agr.** -- same conditions tested along the way as `BASIC DPG`,")
+    lines.append("  normalised so a collapsed chain counts as equal to the nodes it replaced.")
+    lines.append("  This is the metric that actually shows grouping preserved the reasoning.")
+    lines.append("- **Explanation Overlap** -- partial credit when routes only partly match.")
+    lines.append("")
 
     return "\n".join(lines)
 
 
 def render_console_table(per_dataset: Dict[str, Dict[str, object]]) -> str:
     """Plain-text table suitable for stdout."""
-    headers = ("Variant", "Nodes", "Edges", "Unique", "Valid", "PredChars")
+    headers = ("Variant", "Nodes", "Edges", "Unique", "Valid", "PredChars",
+               "DecisAgr", "ExplAgr", "ExplOvlp")
+    widths = (28, 7, 7, 7, 7, 10, 9, 9, 9)
     out_lines: List[str] = []
     for dataset_name in sorted(per_dataset.keys()):
         variant_metrics = per_dataset[dataset_name]["metrics"]
         out_lines.append(f"\n[{dataset_name}]")
-        out_lines.append("  " + " | ".join(f"{h:>10}" for h in headers))
-        out_lines.append("  " + "-+-".join("-" * 10 for _ in headers))
+        out_lines.append("  " + " | ".join(f"{h:>{w}}" for h, w in zip(headers, widths)))
+        out_lines.append("  " + "-+-".join("-" * w for w in widths))
         for variant_label, _short in VARIANTS:
             m = variant_metrics.get(variant_label, {})
             if m.get("_missing"):
-                row = ("(missing)", "-", "-", "-", "-", "-")
+                row = (f"{variant_label} (missing)", "-", "-", "-", "-", "-", "-", "-", "-")
             else:
                 valid = m.get("valid")
                 valid_str = "TRUE" if valid is True else "FALSE" if valid is False else str(valid)
@@ -594,8 +774,11 @@ def render_console_table(per_dataset: Dict[str, Dict[str, object]]) -> str:
                     str(m.get("unique_nodes")),
                     valid_str,
                     str(m.get("predicate_chars")),
+                    _fmt_ratio(m.get("decision_agreement")),
+                    _fmt_ratio(m.get("explanation_agreement")),
+                    _fmt_ratio(m.get("explanation_overlap")),
                 )
-            out_lines.append("  " + " | ".join(f"{c:>10}" for c in row))
+            out_lines.append("  " + " | ".join(f"{c:>{w}}" for c, w in zip(row, widths)))
     return "\n".join(out_lines)
 
 
@@ -654,6 +837,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--include-incomplete", action="store_true",
         help="Also accept wandb runs that don't have all 4 structure artifacts (rows will show (missing) for the absent variants).",
+    )
+    parser.add_argument(
+        "--equiv-samples", type=int, default=200,
+        help="Rows sampled from the local dataset CSV to compute the equivalence "
+             "metrics (default: 200). Graphs are walked once per row, so this "
+             "drives the equivalence runtime.",
+    )
+    parser.add_argument(
+        "--no-equivalence", action="store_true",
+        help="Skip the decision/explanation agreement columns (they need the "
+             "dataset CSV on local disk; the other metrics only need wandb).",
     )
     args = parser.parse_args(argv)
 
@@ -721,6 +915,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     print(f"  - {variant_label} ({variant_ns}): missing{(' -- ' + err) if err else ''}")
                 else:
                     print(f"  - {variant_label}: ok")
+
+            # Graph-vs-graph equivalence against BASIC. Needs the local
+            # dataset CSV for rows; the structures themselves came from
+            # wandb above.
+            if not args.no_equivalence:
+                add_equivalence_metrics(
+                    dataset_name, variant_metrics, args.datasets_dir, args.equiv_samples
+                )
+            strip_internal_keys(variant_metrics)
 
             per_dataset[dataset_name] = {
                 "metrics": variant_metrics,
