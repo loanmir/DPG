@@ -117,6 +117,11 @@ GROUPING_MODULES: Tuple[Tuple[str, str], ...] = (
 # free text that would otherwise explode into hundreds of one-hot columns.
 DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
     "titanic": ["PassengerId", "Name", "Ticket", "Cabin"],
+    # health_insurance's row id is a unique numeric that the trees otherwise
+    # split on (id > 70757, id <= 314509, ...) and the resulting graph
+    # becomes cyclic with no in_degree-0 nodes -- the route walker can't
+    # start, so decision/explanation agreement come out as NaN.
+    "health_insurance": ["id"],
 }
 
 # Per-dataset perc_var override (see config.yaml's ``dpg.default.perc_var``).
