@@ -117,6 +117,10 @@ GROUPING_MODULES: Tuple[Tuple[str, str], ...] = (
 # free text that would otherwise explode into hundreds of one-hot columns.
 DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
     "titanic": ["PassengerId", "Name", "Ticket", "Cabin"],
+    # healthcare_stroke's row id is a unique numeric (5110 unique values in
+    # 5110 rows) the trees otherwise split on, polluting the graph with
+    # 7 id-based predicates that have nothing to do with stroke prediction.
+    "healthcare_stroke": ["id"],
     # health_insurance's row id is a unique numeric that the trees otherwise
     # split on (id > 70757, id <= 314509, ...) and the resulting graph
     # becomes cyclic with no in_degree-0 nodes -- the route walker can't
