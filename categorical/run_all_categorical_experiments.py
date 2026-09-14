@@ -121,6 +121,14 @@ DROP_COLUMNS_OVERRIDES: Dict[str, List[str]] = {
     # 5110 rows) the trees otherwise split on, polluting the graph with
     # 7 id-based predicates that have nothing to do with stroke prediction.
     "healthcare_stroke": ["id"],
+    # ibm_employee_attrition: EmployeeNumber is a unique-per-row ID (1470/1470),
+    # EmployeeCount / Over18 / StandardHours are constant columns. The tree
+    # otherwise splits on them (e.g. EmployeeNumber > 1.5, > 33.0) and the
+    # resulting graph carries ID/constant predicates that have nothing to
+    # do with attrition prediction.
+    "ibm_employee_attrition": [
+        "EmployeeNumber", "EmployeeCount", "Over18", "StandardHours",
+    ],
     # health_insurance's row id is a unique numeric that the trees otherwise
     # split on (id > 70757, id <= 314509, ...) and the resulting graph
     # becomes cyclic with no in_degree-0 nodes -- the route walker can't
