@@ -112,7 +112,14 @@ Clause = Tuple[str, str, List[str]]  # (base, op, cats)
 
 def _combine_clauses(a: List[Clause], b: List[Clause]) -> List[Clause]:
     """``a`` followed by ``b`` (in path order), compacting the boundary if
-    ``a``'s last clause and ``b``'s first clause share a base + operator."""
+    ``a``'s last clause and ``b``'s first clause share a base + operator.
+
+    Note: only adjacent same-base/same-op clauses are merged here. Cross-
+    clause same-base/opposite-op redundancies (``marital NOT IN {divorced}
+    AND marital IN {married}``) are cleaned up by ``_simplify_same_base``
+    after the whole conjunction is assembled -- folding them locally here
+    would lose path-order context needed to pick the tightest clause.
+    """
     combined: List[Clause] = [(base, op, list(cats)) for base, op, cats in a]
     for base, op, cats in b:
         if combined and combined[-1][0] == base and combined[-1][1] == op:
@@ -123,8 +130,56 @@ def _combine_clauses(a: List[Clause], b: List[Clause]) -> List[Clause]:
     return combined
 
 
+def _simplify_same_base(clauses: List[Clause]) -> List[Clause]:
+    """Drop redundant same-base clauses.
+
+    The split-then-merge pass can produce a conjunction with two (or more)
+    clauses on the *same* base feature but with *different* operators, e.g.
+    ``marital NOT IN {divorced} AND marital IN {married}``. Such clauses
+    are not contradictory but one of them is implied by the other -- they
+    compete on the same axis ("which values of ``base`` are allowed here?"),
+    so the looser one is dead weight.
+
+    Two clauses on the same base are kept only if both are needed to
+    describe the allowed set -- which is the case when one is an ``IN``
+    and the other a ``NOT IN`` whose category sets are *disjoint* and the
+    intersection has more than one element (rare in practice). To stay
+    conservative without enumerating the feature's full domain, we keep at
+    most **one** clause per base: the one with the smallest category set
+    (smallest allowed/restricted set == the tightest constraint). Ties
+    favour ``IN`` over ``NOT IN`` because ``base IN {x}`` reads as an
+    explicit positive assertion while ``NOT IN {x}`` carries an implicit
+    domain assumption that the renderer doesn't make explicit.
+
+    See ``docs/grouping_redundancy_fix.md`` for the full rationale and
+    worked example.
+    """
+    by_base: Dict[str, List[Clause]] = {}
+    for base, op, cats in clauses:
+        by_base.setdefault(base, []).append((base, op, list(cats)))
+
+    simplified: List[Clause] = []
+    for base, items in by_base.items():
+        if len(items) == 1:
+            simplified.append(items[0])
+            continue
+        # Pick the tightest: smallest category set, then 'IN' before
+        # 'NOT IN' on ties. ``len(cats)`` is the only proxy for tightness
+        # we have without scanning the dataset for the feature's domain.
+        items.sort(key=lambda c: (len(c[2]), 0 if c[1] == "IN" else 1))
+        simplified.append(items[0])
+
+    return simplified
+
+
 def _format_clauses(clauses: List[Clause]) -> str:
-    return " AND ".join(_format_in_label(base, op, cats) for base, op, cats in clauses)
+    """Render a clause list to its ``base OP {cats} AND ...`` string,
+    applying ``_simplify_same_base`` first so the label never carries
+    duplicate-base redundancies."""
+    return " AND ".join(
+        _format_in_label(base, op, cats)
+        for base, op, cats in _simplify_same_base(clauses)
+    )
 
 
 # ---------------------------------------------------------------------------
