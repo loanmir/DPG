@@ -101,7 +101,13 @@ DEFAULT_DATASETS_DIR = REPO_ROOT / "datasets"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "categorical"
 
 # Folder that holds toy/sweep data, not a real dataset.
-EXCLUDED_DATASET_DIRS = {"dummy_dataset"}
+# ``health_insurance`` is also excluded -- the DPG it produces has 231
+# nodes / 610 edges on a 381k-row dataset with a non-trivial cycle, so
+# the route walker takes ~15-20s per variant on it (vs ~1-3s for every
+# other dataset) and frequently hits its 500-route cap, which makes
+# the explanation metrics noisy. Re-enable it by removing the entry
+# below; the rest of the pipeline still works on it.
+EXCLUDED_DATASET_DIRS = {"dummy_dataset", "health_insurance"}
 
 # The four variants the experiments produce, in display order. The first
 # entry is the "ground truth" DPG the other three are derived from.
@@ -160,7 +166,8 @@ except ImportError:  # pragma: no cover
 
 def discover_dataset_names(datasets_dir: pathlib.Path, only: Optional[Sequence[str]]) -> List[str]:
     """Return dataset names (i.e. subdir names) in sorted order, skipping
-    ``dummy_dataset`` and any subfolder without a CSV. If ``only`` is given
+    ``dummy_dataset`` / ``health_insurance`` and any subfolder without
+    a CSV. If ``only`` is given
     the result is filtered to that subset (preserving sorted order)."""
     if not datasets_dir.exists():
         return []
@@ -475,6 +482,21 @@ def add_equivalence_metrics(
         print(f"  [equiv] could not load rows from {csv_path.name}: {exc}")
         return
 
+    # Domain-aware canonicalisation: lets the metric recognise that
+    # variants emitting ``NOT IN {a, b}`` and ``NOT IN {a} AND IN {b}``
+    # are equivalent (see ``canonical_constraints``). Failures here are
+    # non-fatal -- the metric falls back to no-domain behaviour.
+    domains: Optional[Dict[str, frozenset]] = None
+    try:
+        domains = eq.load_categorical_domains(
+            str(csv_path),
+            drop_columns=DROP_COLUMNS_OVERRIDES.get(dataset_name),
+        )
+        print(f"  [equiv] domain-aware canonicalisation on for {len(domains)} categorical column(s)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [equiv] could not load categorical domains: {exc}; falling back to no-domain comparison")
+        domains = None
+
     try:
         base_graph = eq.structure_to_graph(baseline["_structure"])
         base_nodes = eq.real_nodes(baseline["_structure"])
@@ -490,7 +512,7 @@ def add_equivalence_metrics(
             graph = eq.structure_to_graph(metrics["_structure"])
             nodes = eq.real_nodes(metrics["_structure"])
             result = eq.compare_variants(
-                base_graph, base_nodes, graph, nodes, eval_rows
+                base_graph, base_nodes, graph, nodes, eval_rows, domains=domains
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [equiv] {variant_label}: failed ({type(exc).__name__}: {exc})")
@@ -812,7 +834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--datasets", nargs="+", default=None,
-        help="Restrict to a subset of dataset names (default: all, except dummy_dataset).",
+        help="Restrict to a subset of dataset names (default: all, except dummy_dataset and health_insurance). Pass it explicitly to run on health_insurance despite the default exclusion.",
     )
     parser.add_argument(
         "--entity", default=WANDB_ENTITY,

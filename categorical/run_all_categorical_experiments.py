@@ -96,7 +96,13 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "categorical"
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
 
 # Folder that holds toy/sweep data, not a real dataset.
-EXCLUDED_DATASET_DIRS = {"dummy_dataset"}
+# ``health_insurance`` is also excluded -- the DPG it produces has 231
+# nodes / 610 edges on a 381k-row dataset with a non-trivial cycle, so
+# the route walker takes ~15-20s per variant on it (vs ~1-3s for every
+# other dataset) and frequently hits its 500-route cap, which makes
+# the explanation metrics noisy. Re-enable it by removing the entry
+# below; the rest of the pipeline still works on it.
+EXCLUDED_DATASET_DIRS = {"dummy_dataset", "health_insurance"}
 
 # Fixed output subfolder names, exactly as requested.
 BASIC_LABEL = "BASIC DPG"
@@ -231,7 +237,8 @@ def discover_dataset_csvs(
 ) -> List[Tuple[str, pathlib.Path]]:
     """Return ``(dataset_name, csv_path)`` for every dataset subfolder.
 
-    Skips ``dummy_dataset`` and any subfolder with no CSV inside. If a
+    Skips ``dummy_dataset`` / ``health_insurance`` and any subfolder
+    with no CSV inside. If a
     subfolder has more than one CSV, the first (sorted) one is used and a
     warning is printed.
     """
@@ -559,7 +566,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--datasets", nargs="+", default=None,
-        help="Restrict to a subset of dataset subdir names (default: all, except dummy_dataset).",
+        help="Restrict to a subset of dataset subdir names (default: all, except dummy_dataset and health_insurance). Pass it explicitly to run on health_insurance despite the default exclusion.",
     )
     parser.add_argument(
         "--output-root",
