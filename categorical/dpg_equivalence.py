@@ -155,12 +155,49 @@ def load_eval_rows(
     return [build_eval_row(features_raw.loc[i], features_enc.loc[i]) for i in index]
 
 
+def load_categorical_domains(
+    csv_path: str,
+    drop_columns: Optional[Sequence[str]] = None,
+) -> Dict[str, frozenset]:
+    """Return ``{column_name: frozenset(observed_categories)}`` for every
+    string-typed column in the dataset CSV, after the same
+    drop-columns preprocessing as ``load_eval_rows``.
+
+    Used as the optional ``domains`` argument to ``canonical_constraints``
+    / ``dpg_routes`` / ``compare_variants`` so mixed ``IN``/``NOT IN``
+    clauses on the same feature collapse to a single canonical form
+    (see ``canonical_constraints``).
+
+    Numeric columns are excluded: their category set is implicit (a real
+    interval, not a finite set) and the metric already handles numeric
+    predicates via the ``("num", ...)`` branch which doesn't need a
+    domain. Categorical columns with high cardinality (``> 1024``
+    distinct values) are also excluded -- they're almost certainly free
+    text or unique IDs that don't benefit from a domain-aware collapse
+    and would only inflate memory.
+    """
+    df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
+    if drop_columns:
+        present = [c for c in drop_columns if c in df.columns]
+        if present:
+            df = df.drop(columns=present)
+    domains: Dict[str, frozenset] = {}
+    for col in df.columns:
+        if not (df[col].dtype == object or str(df[col].dtype).startswith("category")):
+            continue
+        values = frozenset(str(v) for v in df[col].dropna().unique())
+        if 0 < len(values) <= 1024:
+            domains[col] = values
+    return domains
+
+
 def compare_variants(
     graph_a: nx.DiGraph,
     nodes_a: Sequence[Tuple[str, str]],
     graph_b: nx.DiGraph,
     nodes_b: Sequence[Tuple[str, str]],
     eval_rows: Sequence[pd.Series],
+    domains: Optional[Dict[str, frozenset]] = None,
 ) -> Dict[str, object]:
     """Full graph-against-graph comparison of two DPG variants.
 
@@ -169,13 +206,19 @@ def compare_variants(
     ``decision_agreement``, ``explanation_agreement``,
     ``explanation_overlap``, ``explanation_partial``.
 
+    ``domains`` (optional) is forwarded to ``dpg_routes`` for the
+    domain-aware canonicalisation described in ``canonical_constraints``.
+    Pass it from ``load_categorical_domains`` to enable comparison that
+    is invariant to whether a variant emits ``NOT IN {a, b}`` or the
+    equivalent ``NOT IN {a} AND IN {b}``.
+
     No model is needed -- this compares two graphs to each other, not
     either graph to the RandomForest.
     """
     preds_a = dpg_predictions(graph_a, nodes_a, eval_rows)
     preds_b = dpg_predictions(graph_b, nodes_b, eval_rows)
-    routes_a = [dpg_routes(graph_a, nodes_a, row) for row in eval_rows]
-    routes_b = [dpg_routes(graph_b, nodes_b, row) for row in eval_rows]
+    routes_a = [dpg_routes(graph_a, nodes_a, row, domains=domains) for row in eval_rows]
+    routes_b = [dpg_routes(graph_b, nodes_b, row, domains=domains) for row in eval_rows]
 
     result: Dict[str, object] = {}
     result.update(compute_agreement(preds_a, preds_b))
@@ -365,25 +408,45 @@ def _canonical_clause(clause: str) -> Optional[tuple]:
     return ("num", feature, op, value)
 
 
-def canonical_constraints(labels: Sequence[str]) -> frozenset:
+def canonical_constraints(
+    labels: Sequence[str],
+    domains: Optional[Dict[str, frozenset]] = None,
+) -> frozenset:
     """Turn the labels visited along one route into a canonical set of
     constraints.
 
-    Two normalisations happen here, and both are needed for a fair
-    comparison between variants:
+    Three normalisations happen here, and all three are needed for a
+    fair comparison between variants:
 
     1. Every clause is rewritten into a grammar-independent form (see
-       ``_canonical_clause``), so one-hot and ``IN``/``NOT IN`` spellings
-       of the same test collapse together.
-    2. Clauses on the same feature with the same operator are merged by
-       unioning their categories -- exactly what ``cat_grouping``'s chain
-       collapsing does. So BASIC visiting ``X NOT IN {OWN}`` then
-       ``X NOT IN {RENT}`` as two separate nodes yields the same
+       ``_canonical_clause``), so one-hot and ``IN``/``NOT IN``
+       spellings of the same test collapse together.
+    2. Clauses on the same feature with the same operator are merged
+       by unioning their categories -- exactly what ``cat_grouping``'s
+       chain collapsing does. So BASIC visiting ``X NOT IN {OWN}``
+       then ``X NOT IN {RENT}`` as two separate nodes yields the same
        constraint as GROUPED's single ``X NOT IN {OWN, RENT}`` node.
+    3. (Optional, only when ``domains`` is supplied.) Mixed
+       ``IN``/``NOT IN`` clauses on the same feature are intersected
+       against the feature's full category set, then re-emitted as a
+       single ``IN {allowed_set}`` clause. This collapses equivalent
+       representations like ``marital NOT IN {single, divorced}`` and
+       ``marital NOT IN {single} AND marital IN {married}`` -- both
+       admit only ``{married}`` once the domain ``{single, married,
+       divorced}`` is known.
 
     Without step 2 the metric would report every successful chain
-    collapse as a difference, i.e. it would punish grouping for doing its
-    job.
+    collapse as a difference, i.e. it would punish grouping for doing
+    its job. Without step 3 the metric would punish the SPLIT-
+    CONJUCTION variant for folding cross-op same-base clauses into a
+    single node -- it would record the merged clause as ``NOT IN
+    {single}`` while BASIC recorded the unfolded form ``NOT IN
+    {single, divorced}``, even though both reject exactly the same
+    rows.
+
+    ``domains`` is keyed by raw column name (e.g. ``"marital"``), not
+    by one-hot dummy name (e.g. ``"marital_married"``); see
+    ``load_categorical_domains`` for the producer.
     """
     cat_buckets: Dict[Tuple[str, str], set] = {}
     others = set()
@@ -398,8 +461,71 @@ def canonical_constraints(labels: Sequence[str]) -> frozenset:
             else:
                 others.add(canon)
 
-    merged = {("cat", base, op, frozenset(cats)) for (base, op), cats in cat_buckets.items()}
-    return frozenset(merged | others)
+    cat_clauses = {("cat", base, op, frozenset(cats))
+                   for (base, op), cats in cat_buckets.items()}
+
+    if domains:
+        cat_clauses = _simplify_against_domains(cat_clauses, domains)
+
+    return frozenset(cat_clauses | others)
+
+
+def _simplify_against_domains(
+    cat_clauses: set,
+    domains: Dict[str, frozenset],
+) -> set:
+    """Per-base domain-aware normalisation.
+
+    For each base that appears in ``cat_clauses`` AND has a known
+    domain, fold every ``IN`` and ``NOT IN`` clause into a single
+    canonical ``IN {allowed}`` clause where ``allowed`` is the set of
+    values that pass all of them. Bases whose ``allowed`` equals the
+    full domain are unconstrained on this route -- their clauses are
+    dropped entirely. Bases without a domain pass through unchanged.
+
+    Example: with ``domains = {"marital": {"single", "married",
+    "divorced"}}``:
+        ``marital NOT IN {single, divorced}``   -> ``marital IN {married}``
+        ``marital NOT IN {single} AND marital IN {married}``   -> ``marital IN {married}``
+
+    Both forms collapse to the same canonical clause, so the route
+    comparison no longer penalises the SPLIT-CONJUCTION variant for
+    merging them.
+    """
+    # Bucket clauses by base.
+    by_base: Dict[str, List[Tuple[str, frozenset]]] = {}
+    passthrough = set()
+    for kind, base, op, cats in cat_clauses:
+        if base in domains:
+            by_base.setdefault(base, []).append((op, cats))
+        else:
+            passthrough.add((kind, base, op, cats))
+
+    simplified: set = set(passthrough)
+    for base, items in by_base.items():
+        domain = domains[base]
+        # Allowed = values that satisfy ALL clauses.
+        in_cats = frozenset.intersection(*[c for op, c in items if op == "IN"]) \
+            if any(op == "IN" for op, _ in items) else domain
+        excluded = frozenset().union(*[c for op, c in items if op == "NOT IN"]) \
+            if any(op == "NOT IN" for op, _ in items) else frozenset()
+        allowed = in_cats - excluded
+        if allowed == domain:
+            # Feature is unconstrained on this route -- drop all
+            # clauses for it. (Conservative: dropping a vacuous
+            # constraint never changes the truth value.)
+            continue
+        if not allowed:
+            # Unsatisfiable -- shouldn't happen for a walk that
+            # actually reached a Class sink, but guard against it by
+            # emitting a sentinel that no other clause can match.
+            # Using ``IN {""}`` ensures the comparison treats this
+            # route as different from any satisfiable one.
+            simplified.add(("cat", base, "IN", frozenset()))
+            continue
+        simplified.add(("cat", base, "IN", allowed))
+
+    return simplified
 
 
 def dpg_routes(
@@ -407,6 +533,7 @@ def dpg_routes(
     nodes: Sequence[Tuple[str, str]],
     sample_row: pd.Series,
     max_routes: int = 500,
+    domains: Optional[Dict[str, frozenset]] = None,
 ) -> Tuple[set, bool]:
     """Every complete route this sample can take through the graph.
 
@@ -415,6 +542,12 @@ def dpg_routes(
     actually *tested* on the way. Returns
     ``({(constraints, class), ...}, truncated)`` where ``constraints`` is
     the canonical constraint set from ``canonical_constraints``.
+
+    ``domains`` (optional) is forwarded to ``canonical_constraints`` for
+    the domain-aware simplification described there. Without it, mixed
+    ``IN``/``NOT IN`` clauses on the same base are NOT collapsed -- the
+    metric then reports the SPLIT-CONJUCTION variant as having different
+    routes from BASIC even when they accept the same rows.
 
     ``max_routes`` caps the enumeration: a densely shared DPG can offer a
     large number of distinct routes for one row, and the flag tells the
@@ -444,7 +577,7 @@ def dpg_routes(
                 next_label = str(label_by_id.get(next_id, ""))
                 if next_label.startswith("Class "):
                     routes.add(
-                        (canonical_constraints(seen_labels), next_label[len("Class "):])
+                        (canonical_constraints(seen_labels, domains=domains), next_label[len("Class "):])
                     )
                     if len(routes) >= max_routes:
                         return routes, True

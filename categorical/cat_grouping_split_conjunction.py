@@ -131,43 +131,94 @@ def _combine_clauses(a: List[Clause], b: List[Clause]) -> List[Clause]:
 
 
 def _simplify_same_base(clauses: List[Clause]) -> List[Clause]:
-    """Drop redundant same-base clauses.
+    """Deduplicate same-base clauses into a tighter equivalent conjunction.
 
     The split-then-merge pass can produce a conjunction with two (or more)
-    clauses on the *same* base feature but with *different* operators, e.g.
-    ``marital NOT IN {divorced} AND marital IN {married}``. Such clauses
-    are not contradictory but one of them is implied by the other -- they
-    compete on the same axis ("which values of ``base`` are allowed here?"),
-    so the looser one is dead weight.
+    clauses on the *same* base feature. There are three cases, each
+    handled differently so the result is always equivalent to (or tighter
+    than) the original -- never looser:
 
-    Two clauses on the same base are kept only if both are needed to
-    describe the allowed set -- which is the case when one is an ``IN``
-    and the other a ``NOT IN`` whose category sets are *disjoint* and the
-    intersection has more than one element (rare in practice). To stay
-    conservative without enumerating the feature's full domain, we keep at
-    most **one** clause per base: the one with the smallest category set
-    (smallest allowed/restricted set == the tightest constraint). Ties
-    favour ``IN`` over ``NOT IN`` because ``base IN {x}`` reads as an
-    explicit positive assertion while ``NOT IN {x}`` carries an implicit
-    domain assumption that the renderer doesn't make explicit.
+    1. **Same base, same operator.** Both clauses admit the same shape
+       (``base IN {a}`` and ``base IN {b}`` -> all rows where ``base`` is
+       in either set). They union into one clause with the category sets
+       concatenated and de-duplicated. Example::
 
-    See ``docs/grouping_redundancy_fix.md`` for the full rationale and
-    worked example.
+           month NOT IN {mar, jun, dec}  AND  month NOT IN {sep}
+           -> month NOT IN {mar, jun, dec, sep}
+
+       This is the case ``_combine_clauses`` *already* handled at adjacent
+       boundary edges -- this helper extends the same union to non-
+       adjacent duplicates that the boundary compactor couldn't see.
+
+    2. **Same base, opposite operators.** Both clauses compete on the
+       same axis ("which values of ``base`` are allowed here?"). One is
+       implied by the other (the tighter one), so the looser is dead
+       weight. Keep only the tighter (smaller category set); ties favour
+       ``IN`` over ``NOT IN`` because ``base IN {x}`` reads as an explicit
+       positive assertion while ``NOT IN {x}`` carries an implicit domain
+       assumption. Example::
+
+           marital NOT IN {divorced}  AND  marital IN {married}
+           -> marital IN {married}
+
+    3. **Single clause on the base.** Pass through unchanged.
+
+    Domain-aware simplification (e.g. converting ``NOT IN {a, b}`` into
+    ``IN {c, d}`` when the domain is ``{a, b, c, d}``) is intentionally
+    out of scope here; it would require enumerating the feature's full
+    category list and is not necessary for the bug fix.
+
+    See ``grouping_redundancy_fix.md`` for the rationale and worked
+    examples.
     """
     by_base: Dict[str, List[Clause]] = {}
     for base, op, cats in clauses:
-        by_base.setdefault(base, []).append((base, op, list(cats)))
+        by_base.setdefault(base, []).append((op, list(cats)))
 
     simplified: List[Clause] = []
     for base, items in by_base.items():
+        # Case 3: single clause on this base -- nothing to merge.
         if len(items) == 1:
-            simplified.append(items[0])
+            op, cats = items[0]
+            simplified.append((base, op, cats))
             continue
-        # Pick the tightest: smallest category set, then 'IN' before
-        # 'NOT IN' on ties. ``len(cats)`` is the only proxy for tightness
-        # we have without scanning the dataset for the feature's domain.
-        items.sort(key=lambda c: (len(c[2]), 0 if c[1] == "IN" else 1))
-        simplified.append(items[0])
+
+        # Split by operator.
+        in_cats: List[str] = []
+        not_in_cats: List[str] = []
+        for op, cats in items:
+            if op == "IN":
+                in_cats.extend(cats)
+            else:
+                not_in_cats.extend(cats)
+
+        # De-duplicate while preserving first-seen order so emitted
+        # labels stay stable across runs.
+        def _dedup(seq: List[str]) -> List[str]:
+            seen, out = set(), []
+            for c in seq:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            return out
+
+        in_cats = _dedup(in_cats)
+        not_in_cats = _dedup(not_in_cats)
+
+        # Case 2: opposite operators present. Pick the tighter side; drop
+        # the looser one. ``IN`` wins ties for readability.
+        if in_cats and not_in_cats:
+            if len(not_in_cats) < len(in_cats):
+                in_cats = []  # NOT IN is tighter, drop IN
+            else:
+                not_in_cats = []  # IN is tighter (or ties), drop NOT IN
+
+        # Case 1: same-op clauses (now possibly just one operator left)
+        # collapse into a single unioned clause.
+        if not_in_cats:
+            simplified.append((base, "NOT IN", not_in_cats))
+        if in_cats:
+            simplified.append((base, "IN", in_cats))
 
     return simplified
 
