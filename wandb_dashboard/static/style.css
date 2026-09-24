@@ -187,6 +187,9 @@ main { max-width: 2400px; margin: 0 auto; padding: 12px 16px 16px; }
   .compare.two.sbs .side { max-height: 300px; }
 }
 .layout-toggle { align-self: center; }
+.graph-toolbar .thr { flex: 1 1 100%; gap: 8px; min-height: 30px; }
+.graph-toolbar .thr input[type=range] { width: 220px; max-width: 45vw; accent-color: var(--accent); vertical-align: middle; padding: 0; border: none; }
+.thr-val { font-variant-numeric: tabular-nums; }
 .sync-note { font-size: 12px; color: var(--text-secondary); background: var(--surface-2); border-left: 3px solid var(--accent); border-radius: 4px; padding: 5px 8px; margin-bottom: 10px; overflow-wrap: anywhere; }
 
 /* charts */

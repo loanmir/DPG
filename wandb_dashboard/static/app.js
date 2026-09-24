@@ -357,6 +357,17 @@ function renderGraphs(el, variants) {
   const compare = $(".compare", el);
   const panes = [];
   const link = (from) => (label) => panes.forEach((p) => p !== from && p.graph?.syncSelect(label));
+  // Edge-weight thresholds: while locked, moving either slider moves the other to the same weight.
+  let locked = store.get("wbv.thresholdLocked", true);
+  const linkThreshold = (from) => (t) => { if (locked) panes.forEach((p) => p !== from && p.graph?.setThreshold(t)); };
+  const lock = {
+    get: () => locked,
+    toggle: () => {
+      locked = !locked; store.set("wbv.thresholdLocked", locked);
+      if (locked && panes[0]?.graph) linkThreshold(panes[0])(panes[0].graph.threshold());
+      return locked;
+    },
+  };
 
   const makePane = (title) => {
     const pane = document.createElement("div"); pane.className = "pane";
@@ -371,7 +382,11 @@ function renderGraphs(el, variants) {
       pane.graph.destroy();
       const idx = themedRenderers.indexOf(pane.graph.rethemer); if (idx >= 0) themedRenderers.splice(idx, 1);
     }
-    pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane) });
+    const isLeft = pane === panes[0] && basic && others.length > 0;
+    pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane), onThreshold: linkThreshold(pane), lock: isLeft ? lock : null });
+    // A newly opened tab inherits the locked threshold.
+    const src = panes.find((p) => p !== pane && p.graph);
+    if (locked && src) pane.graph.setThreshold(src.graph.threshold());
     // Carry a selection made in the other graph over to the newly opened tab.
     const peer = panes.find((p) => p !== pane && p.graph?.ownLabel());
     if (peer) pane.graph.syncSelect(peer.graph.ownLabel());
@@ -415,7 +430,7 @@ function renderGraphs(el, variants) {
   } else compare.classList.add("sbs");
 }
 
-function mountGraph(host, v, { onPin = null } = {}) {
+function mountGraph(host, v, { onPin = null, onThreshold = null, lock = null } = {}) {
   const s = v.structure;
   const labels = new Map(s.nodes.filter((n) => !String(n.id).includes("->")).map((n) => [String(n.id), n.label]));
   const comm = parseCommunities(v.communities);
@@ -424,6 +439,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
   const links = s.graph[linkKey] || [];
   const weights = links.map((l) => +l.weight || 0);
   const wMin = Math.min(...weights), wMax = Math.max(...weights);
+  const uniqW = [...new Set(weights)].sort((x, y) => x - y); // slider steps through the distinct weights
   const nodeIds = new Set(s.graph.nodes.map((n) => String(n.id)));
 
   // community lookup: label -> cluster index
@@ -454,6 +470,11 @@ function mountGraph(host, v, { onPin = null } = {}) {
         <button class="btn sm tallbtn" aria-pressed="false">Taller</button>
         <button class="btn sm png">Export PNG</button>
         ${v.images.length ? `<button class="btn sm orig" aria-pressed="false">Original image${v.images.length > 1 ? "s" : ""}</button>` : ""}
+      </div>
+      <div class="grp thr">
+        <label>Min edge weight <input type="range" class="thr-range" min="0" max="${Math.max(0, uniqW.length - 1)}" step="1" value="0" aria-label="Minimum edge weight"></label>
+        <span class="thr-val small"></span>
+        ${lock ? `<button class="btn sm thr-lock" type="button"></button>` : ""}
       </div>
     </div>
     <div class="graph-wrap">
@@ -509,6 +530,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
         "text-rotation": "autorotate",
       } },
       { selector: ".faded", style: { opacity: 0.12 } },
+      { selector: ".pruned", style: { display: "none" } },
       { selector: "edge.hl", style: { "line-color": cssVar("--accent"), "target-arrow-color": cssVar("--accent"), "z-index": 9 } },
       { selector: "node.focus", style: { "border-width": 3, "border-color": cssVar("--accent") } },
       { selector: "node.match", style: { "border-width": 3, "border-color": cssVar("--series-2") } },
@@ -726,9 +748,43 @@ function mountGraph(host, v, { onPin = null } = {}) {
   if (comm) { mode = "community"; $(".mode", host).value = "community"; }
   applyMode(); details(null); initialView();
 
+  // ---- edge-weight threshold: hide edges below it, then nodes left without a visible edge ----
+  let threshold = wMin;
+  const thrRange = $(".thr-range", host), thrVal = $(".thr-val", host);
+  function applyThreshold(t) {
+    threshold = t;
+    // Slider sits on the first distinct weight >= t (the end if t is above this graph's range).
+    const idx = uniqW.findIndex((w) => w >= t);
+    thrRange.value = String(idx < 0 ? uniqW.length - 1 : idx);
+    cy.batch(() => {
+      cy.edges().forEach((e) => e.toggleClass("pruned", e.data("weight") < t));
+      cy.nodes().forEach((n) => n.toggleClass("pruned", t > wMin && !n.connectedEdges().some((e) => !e.hasClass("pruned"))));
+    });
+    const ve = cy.edges().filter((e) => !e.hasClass("pruned")).length, vn = cy.nodes().filter((n) => !n.hasClass("pruned")).length;
+    thrVal.innerHTML = t <= wMin
+      ? `<span class="muted">showing all</span>`
+      : `≥ <b>${fmtNum(t)}</b> <span class="muted">· ${ve}/${cy.edges().length} edges · ${vn}/${cy.nodes().length} nodes</span>`;
+  }
+  thrRange.oninput = () => {
+    const t = uniqW[+thrRange.value] ?? wMin;
+    applyThreshold(t);
+    if (onThreshold) onThreshold(t <= wMin ? -Infinity : t); // at the minimum = "no threshold" for the peer too
+  };
+  const lockBtn = $(".thr-lock", host);
+  const drawLock = () => {
+    const on = lock.get();
+    // Padlock drawn inline (emoji fonts aren't everywhere); open shackle when unlocked.
+    const shackle = on ? "M5 7V5a3 3 0 0 1 6 0v2" : "M5 7V5a3 3 0 0 1 5.8-1";
+    lockBtn.innerHTML = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" style="vertical-align:-2px;margin-right:5px"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="currentColor"/><path d="${shackle}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>${on ? "Synced" : "Independent"}`;
+    lockBtn.setAttribute("aria-pressed", String(on));
+    lockBtn.title = on ? "Both graphs use the same minimum edge weight. Click to set them separately." : "Each graph has its own minimum edge weight. Click to sync the grouped graph to this one.";
+  };
+  if (lockBtn) { drawLock(); lockBtn.onclick = () => { lock.toggle(); drawLock(); }; }
+  applyThreshold(wMin);
+
   const rethemer = () => { cy.style(style()); applyMode(); };
   themedRenderers.push(rethemer);
-  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, syncSelect, ownLabel: () => ownLabel, refit: () => { cyEl.style.height = ""; cy.resize(); initialView(); } };
+  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, syncSelect, ownLabel: () => ownLabel, setThreshold: (t) => applyThreshold(t), threshold: () => (threshold <= wMin ? -Infinity : threshold), refit: () => { cyEl.style.height = ""; cy.resize(); initialView(); } };
 }
 
 // ---------------------------------------------------------------------------
