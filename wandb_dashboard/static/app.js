@@ -312,23 +312,57 @@ function textWidth(text, bold) { _measure.font = `${bold ? 700 : 400} 12px ${FON
 const SEQ_BLUE = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"];
 
 function renderGraphs(el, variants) {
-  el.innerHTML = `<h2>DPG graphs <span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details.</span></h2>
-    <div class="variant-tabs" role="tablist"></div><div class="variant-body"></div>`;
-  const tabs = $(".variant-tabs", el), body = $(".variant-body", el);
-  let active = null;
-  const show = (i) => {
-    tabs.querySelectorAll("button").forEach((b, j) => b.setAttribute("aria-selected", String(i === j)));
-    if (active) { active.destroy(); }
-    const idx = themedRenderers.indexOf(active?.rethemer); if (idx >= 0) themedRenderers.splice(idx, 1);
-    active = mountGraph(body, variants[i]);
+  const isBasic = (v) => /^BASIC/i.test(v.key);
+  const basic = variants.find(isBasic);
+  const others = variants.filter((v) => v !== basic);
+  el.innerHTML = `<h2>DPG graphs <span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details. Pinning a node in one graph outlines the same predicate in the other.</span></h2>
+    <div class="compare"></div>`;
+  const compare = $(".compare", el);
+  const panes = [];
+  const link = (from) => (label) => panes.forEach((p) => p !== from && p.graph?.markTwin(label));
+
+  const makePane = (title) => {
+    const pane = document.createElement("div"); pane.className = "pane";
+    pane.innerHTML = `<div class="variant-tabs" role="tablist"></div><div class="variant-body"></div>`;
+    compare.appendChild(pane);
+    const obj = { el: pane, graph: null, title };
+    panes.push(obj);
+    return obj;
   };
-  variants.forEach((v, i) => {
-    const b = document.createElement("button"); b.setAttribute("role", "tab"); b.textContent = v.label; b.onclick = () => show(i); tabs.appendChild(b);
-  });
-  show(0);
+  const mountInto = (pane, v) => {
+    if (pane.graph) {
+      pane.graph.destroy();
+      const idx = themedRenderers.indexOf(pane.graph.rethemer); if (idx >= 0) themedRenderers.splice(idx, 1);
+    }
+    pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane), compact: panes.length > 1 });
+    panes.forEach((p) => p !== pane && p.graph?.markTwin(null));
+  };
+
+  // Left: the basic DPG, always shown.
+  if (basic) {
+    const left = makePane("basic");
+    $(".variant-tabs", left.el).innerHTML = `<button role="tab" aria-selected="true" class="static">${esc(basic.label)}</button>`;
+  }
+  // Right: tabs over the grouped variants, defaulting to the conjunction one.
+  let right = null;
+  if (others.length) {
+    right = makePane("grouped");
+    const tabs = $(".variant-tabs", right.el);
+    const def = Math.max(0, others.findIndex((v) => /CONJ/i.test(v.key)));
+    const show = (i) => {
+      tabs.querySelectorAll("button").forEach((b, j) => b.setAttribute("aria-selected", String(i === j)));
+      mountInto(right, others[i]);
+    };
+    others.forEach((v, i) => {
+      const b = document.createElement("button"); b.setAttribute("role", "tab"); b.textContent = v.label; b.onclick = () => show(i); tabs.appendChild(b);
+    });
+    if (basic) mountInto(panes[0], basic);
+    show(def);
+  } else if (basic) mountInto(panes[0], basic);
+  compare.classList.toggle("two", panes.length > 1);
 }
 
-function mountGraph(host, v) {
+function mountGraph(host, v, { onPin = null, compact = false } = {}) {
   const s = v.structure;
   const labels = new Map(s.nodes.filter((n) => !String(n.id).includes("->")).map((n) => [String(n.id), n.label]));
   const comm = parseCommunities(v.communities);
@@ -369,7 +403,7 @@ function mountGraph(host, v) {
         ${v.images.length ? `<button class="btn sm orig" aria-pressed="false">Original image${v.images.length > 1 ? "s" : ""}</button>` : ""}
       </div>
     </div>
-    <div class="graph-wrap">
+    <div class="graph-wrap${compact ? " compact" : ""}">
       <div class="cy"></div>
       <aside class="side"></aside>
     </div>
@@ -424,6 +458,7 @@ function mountGraph(host, v) {
       { selector: "edge.hl", style: { "line-color": cssVar("--accent"), "target-arrow-color": cssVar("--accent"), "z-index": 9 } },
       { selector: "node.focus", style: { "border-width": 3, "border-color": cssVar("--accent") } },
       { selector: "node.match", style: { "border-width": 3, "border-color": cssVar("--series-2") } },
+      { selector: "node.twin", style: { "border-width": 4, "border-color": cssVar("--accent"), "border-style": "dashed" } },
       { selector: "node[?cfill]", style: { "background-color": "data(cfill)", color: "data(ctext)" } },
     ];
   };
@@ -549,6 +584,7 @@ function mountGraph(host, v) {
 
   function select(node, center = false) {
     pinned = node && node.length ? node : null;
+    if (onPin) onPin(pinned ? pinned.data("label") : null);
     highlight(pinned); details(pinned);
     if (pinned && center) cy.animate({ center: { eles: pinned }, duration: 250 });
   }
@@ -564,6 +600,7 @@ function mountGraph(host, v) {
     showTip(`<div>${esc(ed.source().data("label"))} → ${esc(ed.target().data("label"))}</div><div class="t">weight <b>${esc(ed.data("wlabel"))}</b></div>`, e.originalEvent.clientX, e.originalEvent.clientY);
   });
   cy.on("mouseout", "edge", hideTip);
+  cyEl.addEventListener("mouseleave", () => { hideTip(); if (!pinned) highlight(null); });
   cy.on("tap", "node", (e) => select(e.target));
   cy.on("tap", (e) => { if (e.target === cy) select(null); });
 
@@ -605,7 +642,13 @@ function mountGraph(host, v) {
 
   const rethemer = () => { cy.style(style()); applyMode(); };
   themedRenderers.push(rethemer);
-  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer };
+  const markTwin = (label) => {
+    cy.nodes().removeClass("twin");
+    if (!label) return;
+    const twins = cy.nodes().filter((n) => n.data("label") === label).addClass("twin");
+    if (twins.length) cy.animate({ center: { eles: twins }, duration: 250 });
+  };
+  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, markTwin };
 }
 
 // ---------------------------------------------------------------------------
