@@ -305,6 +305,43 @@ function parseNodeMetrics(text) {
   return out;
 }
 
+// ---- cross-graph predicate matching -------------------------------------
+// Reduce a node label to the set of basic-DPG predicates it covers, mirroring
+// categorical/cat_grouping*.py:
+//   one-hot  "<base>_<CAT> <= 0.5"  ->  "<base> NOT IN {CAT}"   (> 0.5 -> IN)
+//   same-feature chains merge into "{A, B}", cross-feature ones join with " AND ".
+// Numeric predicates are never rewritten. Two nodes match when their atom sets overlap.
+const PRED_RE = /^\s*(.+?)\s*(<=|>=|<|>)\s*(-?[\d.]+(?:e[-+]?\d+)?)\s*$/i;
+const IN_RE = /^\s*(.+?)\s+(NOT\s+IN|IN)\s+\{([^}]*)\}\s*$/;
+// Same rule as cat_grouping._split_one_hot_column: split on the last "_", tail must not be numeric.
+function isOneHot(col) {
+  const i = col.lastIndexOf("_"); if (i <= 0 || i === col.length - 1) return false;
+  return isNaN(Number(col.slice(i + 1)));
+}
+function predicateAtoms(label) {
+  label = String(label ?? "").trim();
+  if (/^Class /.test(label)) return [label];
+  const atoms = [];
+  for (const clause of label.split(/\s+AND\s+/)) {
+    const inM = IN_RE.exec(clause);
+    if (inM) {
+      const side = /NOT/.test(inM[2]) ? "le" : "gt";
+      inM[3].split(",").map((c) => c.trim()).filter(Boolean).forEach((c) => atoms.push(`${inM[1].trim()}_${c}|${side}`));
+      continue;
+    }
+    const p = PRED_RE.exec(clause);
+    if (p) {
+      const [, feat, op, val] = p;
+      // A 0.5 threshold on a one-hot column: key it the same way as the IN form above.
+      if (Math.abs(+val - 0.5) < 1e-9 && isOneHot(feat)) atoms.push(`${feat.trim()}|${op.startsWith(">") ? "gt" : "le"}`);
+      else atoms.push(`${feat.trim()}|${op}|${+val}`);
+      continue;
+    }
+    atoms.push(clause.trim());
+  }
+  return atoms;
+}
+
 const cyInstances = [];
 const FONT = "ui-sans-serif, system-ui, sans-serif";
 const _measure = document.createElement("canvas").getContext("2d");
@@ -315,11 +352,11 @@ function renderGraphs(el, variants) {
   const isBasic = (v) => /^BASIC/i.test(v.key);
   const basic = variants.find(isBasic);
   const others = variants.filter((v) => v !== basic);
-  el.innerHTML = `<h2>DPG graphs ${basic && others.length ? `<button class="btn sm layout-toggle" type="button"></button>` : ""}<span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details. Pinning a node in one graph outlines the same predicate in the other.</span></h2>
+  el.innerHTML = `<h2>DPG graphs ${basic && others.length ? `<button class="btn sm layout-toggle" type="button"></button>` : ""}<span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details. Selecting a node in one graph selects every node covering the same predicate in the other (e.g. <span class="mono">parents_usual &lt;= 0.5</span> ↔ <span class="mono">parents NOT IN {usual} AND …</span>).</span></h2>
     <div class="compare"></div>`;
   const compare = $(".compare", el);
   const panes = [];
-  const link = (from) => (label) => panes.forEach((p) => p !== from && p.graph?.markTwin(label));
+  const link = (from) => (label) => panes.forEach((p) => p !== from && p.graph?.syncSelect(label));
 
   const makePane = (title) => {
     const pane = document.createElement("div"); pane.className = "pane";
@@ -335,7 +372,9 @@ function renderGraphs(el, variants) {
       const idx = themedRenderers.indexOf(pane.graph.rethemer); if (idx >= 0) themedRenderers.splice(idx, 1);
     }
     pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane) });
-    panes.forEach((p) => p !== pane && p.graph?.markTwin(null));
+    // Carry a selection made in the other graph over to the newly opened tab.
+    const peer = panes.find((p) => p !== pane && p.graph?.ownLabel());
+    if (peer) pane.graph.syncSelect(peer.graph.ownLabel());
   };
 
   // Left: the basic DPG, always shown.
@@ -430,7 +469,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
   for (const id of nodeIds) {
     const label = labels.get(id) ?? id;
     const isClass = /^Class /.test(label);
-    elements.push({ data: { id, label, isClass: isClass ? 1 : 0, cluster: clusterOf.has(label) ? clusterOf.get(label) : -1 } });
+    elements.push({ data: { id, label, atoms: predicateAtoms(label), isClass: isClass ? 1 : 0, cluster: clusterOf.has(label) ? clusterOf.get(label) : -1 } });
   }
   links.forEach((l, i) => {
     const w = +l.weight || 0;
@@ -444,6 +483,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
     ${s.feature_names ? `<span>${s.feature_names.length} features</span>` : ""}`;
 
   let showWeights = !bigGraph, mode = "default", dir = "LR", pinned = null;
+  let ownLabel = null; // label the user picked in *this* graph (vs one synced in from the other)
 
   const style = () => {
     const nodeFill = cssVar("--node-fill"), nodeText = cssVar("--node-text"), nodeBorder = cssVar("--node-border");
@@ -472,7 +512,6 @@ function mountGraph(host, v, { onPin = null } = {}) {
       { selector: "edge.hl", style: { "line-color": cssVar("--accent"), "target-arrow-color": cssVar("--accent"), "z-index": 9 } },
       { selector: "node.focus", style: { "border-width": 3, "border-color": cssVar("--accent") } },
       { selector: "node.match", style: { "border-width": 3, "border-color": cssVar("--series-2") } },
-      { selector: "node.twin", style: { "border-width": 4, "border-color": cssVar("--accent"), "border-style": "dashed" } },
       { selector: "node[?cfill]", style: { "background-color": "data(cfill)", color: "data(ctext)" } },
     ];
   };
@@ -561,7 +600,18 @@ function mountGraph(host, v, { onPin = null } = {}) {
     });
   }
 
-  function details(node) {
+  const syncNote = (from, n) => from ? `<div class="sync-note">Matched from the other graph: <b>${esc(from)}</b>${n > 1 ? ` · ${n} nodes here` : ""}</div>` : "";
+  function details(node, from = null) {
+    if (node && node.length > 1) {
+      side.innerHTML = `${syncNote(from, node.length)}<h3>${node.length} matching nodes</h3>
+        <ul>${node.map((n) => `<li><button data-id="${esc(n.id())}">${esc(n.data("label"))}</button><span class="num">in ${n.indegree()} · out ${n.outdegree()}</span></li>`).join("")}</ul>`;
+      side.querySelectorAll("button[data-id]").forEach((b) => (b.onclick = () => select(cy.getElementById(b.dataset.id), true)));
+      return;
+    }
+    if (!node && from) {
+      side.innerHTML = `${syncNote(from, 0)}<p class="muted">No node in this graph covers that predicate.</p>`;
+      return;
+    }
     if (!node) {
       side.innerHTML = `<h3>${esc(v.label)}</h3><p class="muted">Hover a node to trace every path through it. Click it to pin that view and see its connections${comm ? ", community and class probabilities" : ""}${metrics ? " and graph metrics" : ""}. Click empty space to clear.</p>
         ${v.classBounds ? `<h4>Class boundaries</h4>${renderClassBounds(v.classBounds)}` : ""}
@@ -577,7 +627,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
     const pr = comm?.probs[label];
     const cl = node.data("cluster");
     const nonAmbIdx = comm ? comm.clusters.map((c, i) => [c, i]) : [];
-    side.innerHTML = `
+    side.innerHTML = `${syncNote(from, 1)}
       <h3>${esc(label)}</h3>
       <div class="small muted">${node.data("isClass") ? "Class node" : "Predicate"} · in ${ins.length} · out ${outs.length}</div>
       ${comm && cl >= 0 ? `<div class="small" style="margin-top:6px"><span class="legend"><span><span class="sw" style="background:${clusterColor(cl)}"></span>${esc(comm.clusters[cl].name)}</span></span></div>` : ""}
@@ -604,9 +654,25 @@ function mountGraph(host, v, { onPin = null } = {}) {
 
   function select(node, center = false) {
     pinned = node && node.length ? node : null;
-    if (onPin) onPin(pinned ? pinned.data("label") : null);
+    ownLabel = pinned ? pinned.data("label") : null;
+    if (onPin) onPin(ownLabel);
     highlight(pinned); details(pinned);
     if (pinned && center) cy.animate({ center: { eles: pinned }, duration: 250 });
+  }
+
+  // Selection pushed from the other graph: select every node whose predicates overlap.
+  function syncSelect(label) {
+    ownLabel = null;
+    if (!label) { pinned = null; highlight(null); details(null); return; }
+    const want = new Set(predicateAtoms(label));
+    const hits = cy.nodes().filter((n) => n.data("atoms").some((a) => want.has(a)));
+    pinned = hits.length ? hits : null;
+    highlight(pinned); details(pinned, label);
+    if (!hits.length) return;
+    // Keep the current zoom if every match fits in view; otherwise zoom out just enough.
+    const bb = hits.boundingBox(), z = cy.zoom(), pad = 60;
+    const fits = bb.w * z <= cy.width() - 2 * pad && bb.h * z <= cy.height() - 2 * pad;
+    cy.animate(fits ? { center: { eles: hits }, duration: 250 } : { fit: { eles: hits, padding: pad }, duration: 250 });
   }
 
   cy.on("mouseover", "node", (e) => { if (!pinned) highlight(e.target); cyEl.style.cursor = "pointer"; });
@@ -662,13 +728,7 @@ function mountGraph(host, v, { onPin = null } = {}) {
 
   const rethemer = () => { cy.style(style()); applyMode(); };
   themedRenderers.push(rethemer);
-  const markTwin = (label) => {
-    cy.nodes().removeClass("twin");
-    if (!label) return;
-    const twins = cy.nodes().filter((n) => n.data("label") === label).addClass("twin");
-    if (twins.length) cy.animate({ center: { eles: twins }, duration: 250 });
-  };
-  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, markTwin, refit: () => { cyEl.style.height = ""; cy.resize(); initialView(); } };
+  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, syncSelect, ownLabel: () => ownLabel, refit: () => { cyEl.style.height = ""; cy.resize(); initialView(); } };
 }
 
 // ---------------------------------------------------------------------------
