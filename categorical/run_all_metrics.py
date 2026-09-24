@@ -557,6 +557,33 @@ def run_has_all_structure_artifacts(run, dataset_name: str) -> Tuple[bool, List[
     return (len(missing) == 0, missing)
 
 
+def fetch_run_by_id(
+    run_id: str,
+    entity: str,
+    project: str,
+) -> Optional[object]:
+    """Fetch a specific wandb ``Run`` by its id. Returns ``None`` if the
+    run is missing, in a non-finished state, or wandb is unavailable.
+
+    Used by ``--run-id`` to target a specific experiment (e.g. when
+    re-running metrics after a bugfix without sweeping every dataset).
+    """
+    if not WANDB_AVAILABLE:
+        return None
+    api = wandb.Api()
+    try:
+        run = api.run(f"{entity}/{project}/{run_id}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [wandb] could not fetch run {run_id}: {exc}")
+        return None
+    if run.state != "finished":
+        print(
+            f"  [wandb] run {run_id} is in state '{run.state}' (expected 'finished'); "
+            f"proceeding anyway -- the structure artifacts may still be readable."
+        )
+    return run
+
+
 def fetch_latest_finished_run(
     dataset_name: str,
     entity: str,
@@ -837,6 +864,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Restrict to a subset of dataset names (default: all, except dummy_dataset and health_insurance). Pass it explicitly to run on health_insurance despite the default exclusion.",
     )
     parser.add_argument(
+        "--run-id", default=None,
+        help="Target a specific wandb run by its id (e.g. 'xx5iw3ft'). When set, "
+             "the script only processes the dataset name reported by that run's "
+             "display_name, ignoring --datasets and the discovery loop. Useful "
+             "for re-running metrics on a specific experiment after a fix.",
+    )
+    parser.add_argument(
         "--entity", default=WANDB_ENTITY,
         help=f"W&B entity (default: {WANDB_ENTITY}).",
     )
@@ -873,10 +907,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    dataset_names = discover_dataset_names(args.datasets_dir, args.datasets)
-    if not dataset_names:
-        print(f"ERROR: no datasets found under {args.datasets_dir}")
-        return 1
+    # When --run-id is given, we only ever process the one dataset that
+    # run belongs to. The dataset name is taken from the run itself, so
+    # the local datasets-dir scan and the --datasets filter are
+    # bypassed -- the run id is the entire input.
+    if args.run_id:
+        print(f"Targeting single wandb run id: {args.run_id}")
+        run = fetch_run_by_id(args.run_id, args.entity, args.project)
+        if run is None:
+            print(f"ERROR: could not load run {args.run_id} from {args.entity}/{args.project}")
+            return 1
+        # ``display_name`` is the dataset folder the experiment was
+        # trained on; fall back to ``name`` for older runs that predate
+        # the display_name field.
+        target_dataset = run.display_name or run.name
+        if not target_dataset:
+            print(f"ERROR: run {args.run_id} has no display_name; cannot infer dataset.")
+            return 1
+        print(f"Run dataset (from display_name): {target_dataset}")
+        dataset_names = [target_dataset]
+    else:
+        dataset_names = discover_dataset_names(args.datasets_dir, args.datasets)
+        if not dataset_names:
+            print(f"ERROR: no datasets found under {args.datasets_dir}")
+            return 1
 
     print("=" * 64)
     print("CATEGORICAL DPG METRICS (basic vs 3 grouping variants)")
@@ -907,16 +961,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"\n[{idx}/{len(dataset_names)}] {dataset_name}")
             print("-" * 40)
 
-            run = fetch_latest_finished_run(
-                dataset_name,
-                args.entity,
-                args.project,
-                args.offline,
-                require_all_artifacts=not args.include_incomplete,
-            )
-            if run is None:
-                print(f"  [wandb] no qualifying finished run for {dataset_name}; skipping")
-                continue
+            if args.run_id:
+                # Already loaded above; reuse it for every dataset in the
+                # single-run path (there should be exactly one).
+                pass
+            else:
+                run = fetch_latest_finished_run(
+                    dataset_name,
+                    args.entity,
+                    args.project,
+                    args.offline,
+                    require_all_artifacts=not args.include_incomplete,
+                )
+                if run is None:
+                    print(f"  [wandb] no qualifying finished run for {dataset_name}; skipping")
+                    continue
 
             run_url = (
                 run.url
@@ -982,7 +1041,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # --- Local markdown report -------------------------------------------
     if per_dataset:
-        report_path = args.output_root / "metrics_report.md"
+        # When targeting a single run by id, write a per-run file so
+        # successive ``--run-id`` invocations don't clobber each other.
+        # The all-datasets path keeps the canonical ``metrics_report.md``
+        # name for backwards compatibility.
+        if args.run_id:
+            report_path = args.output_root / f"metrics_report_{args.run_id}.md"
+        else:
+            report_path = args.output_root / "metrics_report.md"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(render_markdown_report(per_dataset), encoding="utf-8")
         print(f"\nMarkdown report: {report_path}")
