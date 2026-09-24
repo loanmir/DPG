@@ -315,7 +315,7 @@ function renderGraphs(el, variants) {
   const isBasic = (v) => /^BASIC/i.test(v.key);
   const basic = variants.find(isBasic);
   const others = variants.filter((v) => v !== basic);
-  el.innerHTML = `<h2>DPG graphs <span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details. Pinning a node in one graph outlines the same predicate in the other.</span></h2>
+  el.innerHTML = `<h2>DPG graphs ${basic && others.length ? `<button class="btn sm layout-toggle" type="button"></button>` : ""}<span class="muted">rebuilt from the dpg_structure artifacts. Scroll to zoom, drag to pan, hover a node to trace its paths, click it for details. Pinning a node in one graph outlines the same predicate in the other.</span></h2>
     <div class="compare"></div>`;
   const compare = $(".compare", el);
   const panes = [];
@@ -334,7 +334,7 @@ function renderGraphs(el, variants) {
       pane.graph.destroy();
       const idx = themedRenderers.indexOf(pane.graph.rethemer); if (idx >= 0) themedRenderers.splice(idx, 1);
     }
-    pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane), compact: panes.length > 1 });
+    pane.graph = mountGraph($(".variant-body", pane.el), v, { onPin: link(pane) });
     panes.forEach((p) => p !== pane && p.graph?.markTwin(null));
   };
 
@@ -360,9 +360,23 @@ function renderGraphs(el, variants) {
     show(def);
   } else if (basic) mountInto(panes[0], basic);
   compare.classList.toggle("two", panes.length > 1);
+
+  // Side by side vs stacked (wide graphs read better stacked). Remembered per browser.
+  const toggle = $(".layout-toggle", el);
+  if (toggle) {
+    const apply = (stacked) => {
+      compare.classList.toggle("sbs", !stacked);
+      toggle.textContent = stacked ? "⇆ Side by side" : "⇅ Stack vertically";
+      toggle.title = stacked ? "Show the two graphs next to each other" : "Show the two graphs one above the other";
+      panes.forEach((p) => p.graph?.refit());
+    };
+    let stacked = store.get("wbv.graphsStacked", false);
+    apply(stacked);
+    toggle.onclick = () => { stacked = !stacked; store.set("wbv.graphsStacked", stacked); apply(stacked); };
+  } else compare.classList.add("sbs");
 }
 
-function mountGraph(host, v, { onPin = null, compact = false } = {}) {
+function mountGraph(host, v, { onPin = null } = {}) {
   const s = v.structure;
   const labels = new Map(s.nodes.filter((n) => !String(n.id).includes("->")).map((n) => [String(n.id), n.label]));
   const comm = parseCommunities(v.communities);
@@ -403,7 +417,7 @@ function mountGraph(host, v, { onPin = null, compact = false } = {}) {
         ${v.images.length ? `<button class="btn sm orig" aria-pressed="false">Original image${v.images.length > 1 ? "s" : ""}</button>` : ""}
       </div>
     </div>
-    <div class="graph-wrap${compact ? " compact" : ""}">
+    <div class="graph-wrap">
       <div class="cy"></div>
       <aside class="side"></aside>
     </div>
@@ -475,13 +489,19 @@ function mountGraph(host, v, { onPin = null, compact = false } = {}) {
   // Wide DPGs (hundreds of px per rank) are unreadable when fit whole; open at a readable zoom
   // anchored at the entry side and size the canvas to the graph. "Fit" shows the whole thing.
   const READABLE = 0.75;
+  // When the details panel sits beside the canvas, cap it at the canvas height (no dead space below).
+  function fitSide() {
+    const beside = getComputedStyle(cyEl.parentElement).gridTemplateColumns.trim().split(/\s+/).length > 1;
+    side.style.maxHeight = beside ? cyEl.style.height || "" : "";
+  }
   function initialView() {
-    if (cyEl.classList.contains("tall")) { cy.resize(); cy.fit(undefined, 20); return; }
+    if (cyEl.classList.contains("tall")) { cy.resize(); cy.fit(undefined, 20); side.style.maxHeight = ""; return; }
     const bb = cy.elements().boundingBox(), W = cyEl.clientWidth;
     const fitZoom = Math.min((W - 40) / bb.w, 600 / bb.h);
     const z = Math.min(Math.max(fitZoom, 0.05), 1.2) < READABLE ? READABLE : Math.min(fitZoom, 1.2);
     cyEl.style.height = Math.round(Math.min(Math.max(bb.h * z + 60, 420), 640)) + "px";
     cy.resize(); cy.zoom(z);
+    fitSide();
     if (dir === "LR") cy.pan({ x: 20 - bb.x1 * z, y: cyEl.clientHeight / 2 - (bb.y1 + bb.h / 2) * z });
     else cy.pan({ x: W / 2 - (bb.x1 + bb.w / 2) * z, y: 20 - bb.y1 * z });
   }
@@ -648,7 +668,7 @@ function mountGraph(host, v, { onPin = null, compact = false } = {}) {
     const twins = cy.nodes().filter((n) => n.data("label") === label).addClass("twin");
     if (twins.length) cy.animate({ center: { eles: twins }, duration: 250 });
   };
-  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, markTwin };
+  return { destroy: () => { hideTip(); const i = cyInstances.indexOf(cy); if (i >= 0) cyInstances.splice(i, 1); cy.destroy(); }, rethemer, markTwin, refit: () => { cyEl.style.height = ""; cy.resize(); initialView(); } };
 }
 
 // ---------------------------------------------------------------------------
