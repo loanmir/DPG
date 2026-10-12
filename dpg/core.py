@@ -496,6 +496,28 @@ class DecisionPredicateGraph:
             )
         return dot
 
+    @staticmethod
+    def _label_to_node_id(label: str) -> str:
+        """SHA1-based 64-bit node id used by the DPG graph builder."""
+        return str(int(hashlib.sha1(label.encode()).hexdigest(), 16))
+    
+    def get_decimal_threshold(self) -> int:
+        """Return the threshold rounding precision used when building the DPG."""
+        return self.decimal_threshold
+    
+    def get_node_ids_for_trace(self, labels: List[str]) -> List[str]:
+        """
+        Map a list of DPG labels to native node IDs.
+    
+        The hashing MUST match the one used in ``generate_dot`` (see
+        ``_label_to_node_id``) so that traced nodes can be validated against
+        ``self._graph`` at explain time.
+        """
+        return [self._label_to_node_id(label) for label in labels]
+    
+
+
+
     def to_networkx(self, graphviz_graph: Any) -> Tuple[Any, List[List[str]]]:
         """
         Convert Graphviz graph to NetworkX format.
@@ -539,3 +561,5 @@ class DecisionPredicateGraph:
             else:
                 networkx_graph.add_edge(src, dest)
         return networkx_graph, sorted(nodes_list, key=lambda x: x[0])
+
+    
