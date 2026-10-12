@@ -71,6 +71,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
+import numpy as np
+import pandas as pd
 from networkx.readwrite import json_graph
 
 # --- Repo / import setup --------------------------------------------------
@@ -430,6 +432,18 @@ EQUIVALENCE_KEYS = (
     "explanation_partial",
 )
 
+# Columns produced by ``add_faithfulness_metrics`` and shipped in the
+# wandb table. ``faithfulness_score`` is the weighted composite from
+# ``DPGExplainer.evaluate_faithfulness``; the rest are the three
+# components we surface separately so a regression in one weight can be
+# diagnosed without re-running the metric.
+FAITHFULNESS_KEYS = (
+    "faithfulness_score",
+    "output_fidelity",
+    "mean_trace_coverage_score",
+    "mean_recombination_rate",
+)
+
 
 def find_dataset_csv(datasets_dir: pathlib.Path, dataset_name: str) -> Optional[pathlib.Path]:
     """Locate a dataset's CSV on local disk, or None if it isn't there.
@@ -531,6 +545,256 @@ def strip_internal_keys(variant_metrics: Dict[str, Dict[str, object]]) -> None:
     are large and must not end up in the report or the wandb table."""
     for metrics in variant_metrics.values():
         metrics.pop("_structure", None)
+
+
+# ---------------------------------------------------------------------------
+# Faithfulness (graph walk vs black-box model)
+# ---------------------------------------------------------------------------
+#
+# ``evaluate_faithfulness`` on ``DPGExplainer`` needs:
+#   * the fitted model (RandomForestClassifier) -- not stored in the
+#     structure artifact, so we retrain it here with the exact same
+#     hyperparameters / seed the experiment runner uses, and
+#   * a sample of evaluation rows -- we reuse ``load_eval_rows`` so the
+#     faithfulness rows are encoded the same way as the equivalence rows.
+#
+# The retrained model is byte-identical across runs because both this
+# script and ``run_all_categorical_experiments.py`` use
+# ``RANDOM_STATE = 27`` / ``NUM_TREES = 100`` and the same
+# ``train_test_split`` order via ``train_cv`` (sklearn ``KFold`` with
+# the same seed). The first KFold split's training fold is what the
+# original ``DPGExplainer.fit()`` saw; we use the *same* split to keep
+# the trained model on a distribution that produced the stored graph.
+#
+# Cost: each variant retrains a RandomForest and walks N rows through it
+# (``N = --faith-samples``, default 50). Use ``--no-faithfulness`` to
+# skip this entirely if you're only after the structural metrics.
+
+
+def _retrain_baseline_model(
+    csv_path: pathlib.Path,
+    feature_names: List[str],
+    target_names: List[str],
+    dataset_name: str,
+):
+    """Re-fit a RandomForestClassifier on the same train fold the
+    original experiment used.
+
+    Returns ``(model, X_train_df, feature_names_used, target_names_used)``
+    or ``None`` if the dataset CSV is missing or the columns don't line
+    up with the structure JSON. Failures are non-fatal: the caller
+    surfaces them as ``None`` faithfulness columns in the table.
+    """
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import train_test_split
+        from categorical.run_all_categorical_experiments import (
+            DROP_COLUMNS_OVERRIDES,
+            NUM_TREES,
+            RANDOM_STATE,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] could not import training helpers: {exc}")
+        return None
+
+    try:
+        df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] could not read {csv_path.name}: {exc}")
+        return None
+
+    drop_cols = [c for c in DROP_COLUMNS_OVERRIDES.get(dataset_name, []) if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    target_col = df.columns[-1]
+    df = df.dropna(subset=[target_col]).reset_index(drop=True)
+
+    # Same preprocessing order as ``run_all_categorical_experiments.load_dataset``.
+    features_raw = df.iloc[:, :-1]
+    y = df[target_col].values
+    X_enc = pd.get_dummies(features_raw, drop_first=False)
+    X_enc = X_enc.replace([np.inf, -np.inf], np.nan).fillna(X_enc.mean())
+    X_enc = np.round(X_enc, 3)
+
+    # Match the experiment's train/test split order. The runner uses
+    # ``KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)`` for
+    # CV; the first split's training fold is what ``DPGExplainer.fit()``
+    # saw. ``train_test_split`` with the same seed reproduces the same
+    # 80/20 partition when ``test_size=0.2``.
+    X_train, _X_test, y_train, _y_test = train_test_split(
+        X_enc, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    )
+    X_train = X_train.reset_index(drop=True)
+
+    model = RandomForestClassifier(n_estimators=NUM_TREES, random_state=RANDOM_STATE)
+    model.fit(X_train, y_train)
+    return model, X_train, list(X_enc.columns), [str(t) for t in target_names]
+
+
+def _faithfulness_for_variant(
+    variant_label: str,
+    metrics: Dict[str, object],
+    csv_path: pathlib.Path,
+    dataset_name: str,
+    n_samples: int,
+) -> None:
+    """Fill in the faithfulness columns for one variant, in place.
+
+    Reads the cached structure dict (``metrics["_structure"]``), rebuilds
+    a NetworkX graph from it, re-fits a RandomForest on the same training
+    fold, wraps it in a ``DPGExplainer``, then runs
+    ``evaluate_faithfulness`` on a sample of the dataset CSV.
+    """
+    structure = metrics.get("_structure")
+    if structure is None or metrics.get("_missing"):
+        return
+
+    feature_names = structure.get("feature_names")
+    target_names = structure.get("target_names")
+    if not feature_names or not target_names:
+        print(
+            f"  [faith] {variant_label}: structure JSON lacks "
+            f"feature_names/target_names; skipping (older run?)"
+        )
+        return
+
+    # Re-fit the RF on the same training fold.
+    retrained = _retrain_baseline_model(
+        csv_path, feature_names, target_names, dataset_name
+    )
+    if retrained is None:
+        return
+    model, _X_train_df, used_feature_names, used_target_names = retrained
+
+    # The encoding pipeline may have produced more columns than
+    # ``feature_names`` (because of one-hot expansion). Build the
+    # explainer with the encoded column names so it matches what the
+    # model was actually fitted on.
+    try:
+        from dpg import DPGExplainer
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] could not import DPGExplainer: {exc}")
+        return
+
+    try:
+        explainer = DPGExplainer(
+            model=model,
+            feature_names=used_feature_names,
+            target_names=used_target_names,
+        )
+        # ``evaluate_faithfulness`` needs the original (un-normalized)
+        # model so ``model.predict`` goes through sklearn's real path.
+        # DecisionPredicateGraph shallow-copies the model internally; for
+        # ``GradientBoostingClassifier`` that copy can break ``predict``,
+        # so we keep a reference to the model we actually trained.
+        explainer._original_model = model
+        # The structure JSON is the single source of truth for the graph;
+        # inject it directly so we don't pay the (slow) extraction cost
+        # twice. ``eq.structure_to_graph`` returns a NetworkX DiGraph
+        # keyed under the same SHA1 hashing scheme used at training
+        # time, so the trace recorder in ``explain_local`` will match
+        # graph nodes by id.
+        explainer._is_fitted = True
+        explainer._graph = eq.structure_to_graph(structure)
+        explainer._nodes = eq.real_nodes(structure)
+        explainer._dot = None  # not needed for faithfulness
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] {variant_label}: could not build explainer "
+              f"({type(exc).__name__}: {exc})")
+        return
+
+    # Pull a reproducible sample of evaluation rows, same loader the
+    # equivalence step uses. ``y`` (real labels) is needed for the
+    # ``local_accuracy`` sub-metric.
+    try:
+        from categorical import dpg_equivalence as _eq
+        rows = _eq.load_eval_rows(
+            str(csv_path),
+            drop_columns=DROP_COLUMNS_OVERRIDES.get(dataset_name),
+            n_samples=n_samples,
+        )
+        # ``load_eval_rows`` returns Series whose index contains BOTH
+        # the raw column names AND the encoded column names (the loader
+        # deliberately keeps both to handle "is this a numeric threshold?"
+        # look-ups). The DPG was trained on encoded columns only, so we
+        # must keep just the encoded subset.
+        keep = [c for c in used_feature_names if c in rows[0].index]
+        X_eval = pd.DataFrame(
+            [{c: row[c] for c in keep} for row in rows],
+            columns=keep,
+        )
+        # Recover labels for ``y_true``. Re-run the same preprocessing
+        # the loader uses so the row indices line up (the loader
+        # ``reset_index(drop=True)``s the dataframe, so positionally
+        # ``rows[i]`` corresponds to the i-th row of the processed df).
+        raw_df = pd.read_csv(csv_path, sep=None, engine="python",
+                             encoding="utf-8-sig")
+        drop_cols = [c for c in DROP_COLUMNS_OVERRIDES.get(dataset_name, [])
+                     if c in raw_df.columns]
+        if drop_cols:
+            raw_df = raw_df.drop(columns=drop_cols)
+        target_col = raw_df.columns[-1]
+        raw_df = raw_df.dropna(subset=[target_col]).reset_index(drop=True)
+        # The loader samples without replacement using random_state=27
+        # on the post-dropna reset-index DataFrame. Reproduce that.
+        sampled_pos = (
+            raw_df.iloc[:, :-1]
+            .sample(n=min(n_samples, len(raw_df)), random_state=27)
+            .index
+            .tolist()
+        )
+        y_eval = raw_df.loc[sampled_pos, target_col].tolist()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] {variant_label}: could not load eval rows "
+              f"({type(exc).__name__}: {exc})")
+        return
+
+    try:
+        details = explainer.evaluate_faithfulness(
+            X_eval,
+            y_true=y_eval,
+            max_samples=n_samples,
+            return_details=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [faith] {variant_label}: evaluate_faithfulness failed "
+              f"({type(exc).__name__}: {exc})")
+        return
+
+    metrics["faithfulness_score"] = details.get("faithfulness_score")
+    metrics["output_fidelity"] = details.get("output_fidelity")
+    metrics["mean_trace_coverage_score"] = details.get("mean_trace_coverage_score")
+    metrics["mean_recombination_rate"] = details.get("mean_recombination_rate")
+    print(
+        f"  [faith] {variant_label}: faithfulness={details.get('faithfulness_score')}, "
+        f"output_fidelity={details.get('output_fidelity')}"
+    )
+
+
+def add_faithfulness_metrics(
+    dataset_name: str,
+    variant_metrics: Dict[str, Dict[str, object]],
+    datasets_dir: pathlib.Path,
+    n_samples: int,
+) -> None:
+    """Fill in the faithfulness columns for every variant, in place.
+
+    Re-fits a baseline RandomForest on each variant and walks the same
+    CSV sample the equivalence pass used. Errors per-variant are
+    non-fatal: the columns stay ``None`` so a single bad variant cannot
+    take the whole dataset's row down.
+    """
+    csv_path = find_dataset_csv(datasets_dir, dataset_name)
+    if csv_path is None:
+        print(f"  [faith] no local CSV under {datasets_dir / dataset_name}; skipping")
+        return
+    print(f"  [faith] computing faithfulness on {len(variant_metrics)} variant(s) "
+          f"({n_samples} samples each)")
+    for variant_label, metrics in variant_metrics.items():
+        _faithfulness_for_variant(
+            variant_label, metrics, csv_path, dataset_name, n_samples
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +927,13 @@ def _build_summary_rows(
                 metrics.get("explanation_agreement"),
                 metrics.get("explanation_overlap"),
                 metrics.get("explanation_partial"),
+                # Faithfulness (graph walk vs black-box model). Composite
+                # first, then the three components we surface so a drop
+                # in one weight is diagnosable without re-running.
+                metrics.get("faithfulness_score"),
+                metrics.get("output_fidelity"),
+                metrics.get("mean_trace_coverage_score"),
+                metrics.get("mean_recombination_rate"),
                 run_url,
             ]
         )
@@ -684,6 +955,15 @@ SUMMARY_COLUMNS = [
     "explanation_agreement",
     "explanation_overlap",
     "explanation_partial",
+    # Faithfulness (graph walk vs black-box model).
+    # faithfulness_score: weighted composite of the four signals.
+    # output_fidelity: share of rows where DPG walk agrees with the model.
+    # mean_trace_coverage_score: how much of the graph the explanation touched.
+    # mean_recombination_rate: how often the explanation reused the same nodes.
+    "faithfulness_score",
+    "output_fidelity",
+    "mean_trace_coverage_score",
+    "mean_recombination_rate",
     "wandb_run_url",
 ]
 
@@ -766,12 +1046,15 @@ def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
         lines.append(
             "| Variant | Nodes | Edges | Unique Nodes | Valid | Predicate Chars | "
             "Decision Agr. | Explanation Agr. | Explanation Overlap |"
+            " Faithfulness | Output Fidelity | Trace Coverage | Recombination |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for variant_label, _short in VARIANTS:
             m = variant_metrics.get(variant_label, {})
             if m.get("_missing"):
-                lines.append(f"| {variant_label} | (missing) | - | - | - | - | - | - | - |")
+                lines.append(
+                    f"| {variant_label} | (missing) | - | - | - | - | - | - | - | - | - | - | - |"
+                )
                 continue
             valid = m.get("valid")
             valid_str = "TRUE" if valid is True else "FALSE" if valid is False else str(valid)
@@ -780,7 +1063,11 @@ def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
                 f"{m.get('unique_nodes')} | {valid_str} | {m.get('predicate_chars')} | "
                 f"{_fmt_ratio(m.get('decision_agreement'))} | "
                 f"{_fmt_ratio(m.get('explanation_agreement'))} | "
-                f"{_fmt_ratio(m.get('explanation_overlap'))} |"
+                f"{_fmt_ratio(m.get('explanation_overlap'))} | "
+                f"{_fmt_ratio(m.get('faithfulness_score'))} | "
+                f"{_fmt_ratio(m.get('output_fidelity'))} | "
+                f"{_fmt_ratio(m.get('mean_trace_coverage_score'))} | "
+                f"{_fmt_ratio(m.get('mean_recombination_rate'))} |"
             )
         lines.append("")
 
@@ -793,6 +1080,12 @@ def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
     lines.append("  normalised so a collapsed chain counts as equal to the nodes it replaced.")
     lines.append("  This is the metric that actually shows grouping preserved the reasoning.")
     lines.append("- **Explanation Overlap** -- partial credit when routes only partly match.")
+    lines.append("- **Faithfulness** -- weighted composite "
+                 "(0.35 output_fidelity + 0.30 trace_coverage + 0.20 anti_recombination + 0.15 evidence_margin).")
+    lines.append("- **Output Fidelity** -- fraction of rows where the DPG walk agrees with the model.")
+    lines.append("- **Trace Coverage** -- how much of the graph the local explanation actually touched.")
+    lines.append("- **Recombination** -- how often the explanation reused the same nodes "
+                 "(lower is better; appears as 1 - recombination in the composite).")
     lines.append("")
 
     return "\n".join(lines)
@@ -801,8 +1094,9 @@ def render_markdown_report(per_dataset: Dict[str, Dict[str, object]]) -> str:
 def render_console_table(per_dataset: Dict[str, Dict[str, object]]) -> str:
     """Plain-text table suitable for stdout."""
     headers = ("Variant", "Nodes", "Edges", "Unique", "Valid", "PredChars",
-               "DecisAgr", "ExplAgr", "ExplOvlp")
-    widths = (28, 7, 7, 7, 7, 10, 9, 9, 9)
+               "DecisAgr", "ExplAgr", "ExplOvlp",
+               "Faith", "OutFid", "TraceCov", "Recomb")
+    widths = (28, 7, 7, 7, 7, 10, 9, 9, 9, 7, 7, 9, 8)
     out_lines: List[str] = []
     for dataset_name in sorted(per_dataset.keys()):
         variant_metrics = per_dataset[dataset_name]["metrics"]
@@ -812,7 +1106,9 @@ def render_console_table(per_dataset: Dict[str, Dict[str, object]]) -> str:
         for variant_label, _short in VARIANTS:
             m = variant_metrics.get(variant_label, {})
             if m.get("_missing"):
-                row = (f"{variant_label} (missing)", "-", "-", "-", "-", "-", "-", "-", "-")
+                row = (f"{variant_label} (missing)",
+                       "-", "-", "-", "-", "-", "-", "-", "-",
+                       "-", "-", "-", "-")
             else:
                 valid = m.get("valid")
                 valid_str = "TRUE" if valid is True else "FALSE" if valid is False else str(valid)
@@ -826,6 +1122,10 @@ def render_console_table(per_dataset: Dict[str, Dict[str, object]]) -> str:
                     _fmt_ratio(m.get("decision_agreement")),
                     _fmt_ratio(m.get("explanation_agreement")),
                     _fmt_ratio(m.get("explanation_overlap")),
+                    _fmt_ratio(m.get("faithfulness_score")),
+                    _fmt_ratio(m.get("output_fidelity")),
+                    _fmt_ratio(m.get("mean_trace_coverage_score")),
+                    _fmt_ratio(m.get("mean_recombination_rate")),
                 )
             out_lines.append("  " + " | ".join(f"{c:>{w}}" for c, w in zip(row, widths)))
     return "\n".join(out_lines)
@@ -904,6 +1204,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--no-equivalence", action="store_true",
         help="Skip the decision/explanation agreement columns (they need the "
              "dataset CSV on local disk; the other metrics only need wandb).",
+    )
+    parser.add_argument(
+        "--faith-samples", type=int, default=50,
+        help="Rows sampled from the local dataset CSV to compute the faithfulness "
+             "metrics (default: 50). Smaller than --equiv-samples because each "
+             "sample requires re-fitting a RandomForest and walking it. "
+             "Ignored when --no-faithfulness is set.",
+    )
+    parser.add_argument(
+        "--no-faithfulness", action="store_true",
+        help="Skip the faithfulness columns (they need the dataset CSV on local "
+             "disk AND a re-trained RandomForest, which is the slowest step).",
     )
     args = parser.parse_args(argv)
 
@@ -1003,6 +1315,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not args.no_equivalence:
                 add_equivalence_metrics(
                     dataset_name, variant_metrics, args.datasets_dir, args.equiv_samples
+                )
+
+            # Faithfulness (graph walk vs black-box model). Runs BEFORE
+            # ``strip_internal_keys`` because it needs ``_structure``.
+            # Per-variant failures are non-fatal -- they leave the
+            # columns as None rather than taking the whole row down.
+            if not args.no_faithfulness:
+                add_faithfulness_metrics(
+                    dataset_name,
+                    variant_metrics,
+                    args.datasets_dir,
+                    args.faith_samples,
                 )
             strip_internal_keys(variant_metrics)
 
