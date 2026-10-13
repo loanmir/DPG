@@ -438,7 +438,7 @@ def canonical_constraints(
     Without step 2 the metric would report every successful chain
     collapse as a difference, i.e. it would punish grouping for doing
     its job. Without step 3 the metric would punish the SPLIT-
-    CONJUCTION variant for folding cross-op same-base clauses into a
+    CONJUNCTION variant for folding cross-op same-base clauses into a
     single node -- it would record the merged clause as ``NOT IN
     {single}`` while BASIC recorded the unfolded form ``NOT IN
     {single, divorced}``, even though both reject exactly the same
@@ -489,7 +489,7 @@ def _simplify_against_domains(
         ``marital NOT IN {single} AND marital IN {married}``   -> ``marital IN {married}``
 
     Both forms collapse to the same canonical clause, so the route
-    comparison no longer penalises the SPLIT-CONJUCTION variant for
+    comparison no longer penalises the SPLIT-CONJUNCTION variant for
     merging them.
     """
     # Bucket clauses by base.
@@ -546,7 +546,7 @@ def dpg_routes(
     ``domains`` (optional) is forwarded to ``canonical_constraints`` for
     the domain-aware simplification described there. Without it, mixed
     ``IN``/``NOT IN`` clauses on the same base are NOT collapsed -- the
-    metric then reports the SPLIT-CONJUCTION variant as having different
+    metric then reports the SPLIT-CONJUNCTION variant as having different
     routes from BASIC even when they accept the same rows.
 
     ``max_routes`` caps the enumeration: a densely shared DPG can offer a

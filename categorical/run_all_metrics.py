@@ -16,7 +16,7 @@ For each dataset folder under ``DPG/datasets/`` (skipping ``dummy_dataset``):
        BASIC_DPG__<dataset>_dpg_structure                (basic DPG)
        GROUPED_DPG__<dataset>_DPG_grouped_structure      (cat_grouping.py)
        GROUPED-SPLIT_DPG__<dataset>_DPG_split_grouped_structure
-       GROUPED-SPLIT-CONJUCTION_DPG__<dataset>_DPG_split_grouped_conjunction_structure
+       GROUPED-SPLIT-CONJUNCTION_DPG__<dataset>_DPG_split_grouped_conjunction_structure
 
 2. Download each ``dpg_structure`` artifact into a per-run cache folder,
    parse the JSON, and compute:
@@ -117,7 +117,7 @@ VARIANTS: Tuple[Tuple[str, str], ...] = (
     ("BASIC DPG", "BASIC_DPG"),
     ("GROUPED DPG", "GROUPED_DPG"),
     ("GROUPED-SPLIT DPG", "GROUPED-SPLIT_DPG"),
-    ("GROUPED-SPLIT-CONJUCTION DPG", "GROUPED-SPLIT-CONJUCTION_DPG"),
+    ("GROUPED-SPLIT-CONJUNCTION DPG", "GROUPED-SPLIT-CONJUNCTION_DPG"),
 )
 
 # W&B artifact name fragments per variant. The full artifact name is
@@ -132,7 +132,7 @@ _ARTIFACT_FILE_STEM_BY_VARIANT: Dict[str, str] = {
     "BASIC_DPG": "_dpg_structure",
     "GROUPED_DPG": "_DPG_grouped_structure",
     "GROUPED-SPLIT_DPG": "_DPG_split_grouped_structure",
-    "GROUPED-SPLIT-CONJUCTION_DPG": "_DPG_split_grouped_conjunction_structure",
+    "GROUPED-SPLIT-CONJUNCTION_DPG": "_DPG_split_grouped_conjunction_structure",
 }
 
 # Type tag all structure-JSON artifacts use -- lets us find them on a run

@@ -18,7 +18,7 @@ script:
      * ``BASIC DPG``                      -- the raw DPGExplainer output
      * ``GROUPED DPG``                    -- cat_grouping.py output
      * ``GROUPED-SPLIT DPG``              -- cat_grouping_split.py output
-     * ``GROUPED-SPLIT-CONJUCTION DPG``   -- cat_grouping_split_conjunction.py output
+     * ``GROUPED-SPLIT-CONJUNCTION DPG``   -- cat_grouping_split_conjunction.py output
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
@@ -108,7 +108,7 @@ EXCLUDED_DATASET_DIRS = {"dummy_dataset", "health_insurance"}
 BASIC_LABEL = "BASIC DPG"
 GROUPED_LABEL = "GROUPED DPG"
 SPLIT_LABEL = "GROUPED-SPLIT DPG"
-CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUCTION DPG"
+CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUNCTION DPG"
 
 # The three grouping scripts to run against each basic DPG structure,
 # keyed by their importable module name (relative to the ``categorical``
