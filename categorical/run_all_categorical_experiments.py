@@ -12,13 +12,18 @@ script:
 2. Feeds the resulting DPG structure JSON through the three grouping
    scripts living next to this one: ``cat_grouping.py``,
    ``cat_grouping_split.py`` and ``cat_grouping_split_conjunction.py``.
-3. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in four fixed
+3. Runs ``cat_duplicate_split_peer.py`` on the
+   ``cat_grouping_split_conjunction`` output to drop the parent/
+   child clause redundancies that cross-feature conjunction splitting
+   can leave behind, and renders the deduplicated graph.
+4. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in five fixed
    subfolders:
 
-     * ``BASIC DPG``                      -- the raw DPGExplainer output
-     * ``GROUPED DPG``                    -- cat_grouping.py output
-     * ``GROUPED-SPLIT DPG``              -- cat_grouping_split.py output
-     * ``GROUPED-SPLIT-CONJUNCTION DPG``   -- cat_grouping_split_conjunction.py output
+     * ``BASIC DPG``                                -- the raw DPGExplainer output
+     * ``GROUPED DPG``                              -- cat_grouping.py output
+     * ``GROUPED-SPLIT DPG``                        -- cat_grouping_split.py output
+     * ``GROUPED-SPLIT-CONJUNCTION DPG``            -- cat_grouping_split_conjunction.py output
+     * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG`` -- cat_duplicate_split_peer.py output (deduplicated JSON + PNG)
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
@@ -109,6 +114,7 @@ BASIC_LABEL = "BASIC DPG"
 GROUPED_LABEL = "GROUPED DPG"
 SPLIT_LABEL = "GROUPED-SPLIT DPG"
 CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUNCTION DPG"
+DEDUPLICATED_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG"
 
 # The three grouping scripts to run against each basic DPG structure,
 # keyed by their importable module name (relative to the ``categorical``
@@ -479,6 +485,17 @@ def run_one_dataset(
         else:
             print(f"  [ok]   {module_name} -> {out_dir}")
 
+    # --- Deduplication pass: read the GROUPED-SPLIT-CONJUNCTION output --
+    # The deduplication script has a different API from the three grouping
+    # scripts above (no ``_process_subdir``), so it's invoked directly here
+    # rather than via the ``GROUPING_MODULES`` loop. It writes its JSON +
+    # PNG into its own subfolder, which the rglob below picks up so both
+    # files get logged to W&B.
+    try:
+        run_deduplication_pass(run_id, dataset_out, visualization_config)
+    except Exception as exc:  # noqa: BLE001 - report and continue
+        print(f"  [err]  cat_duplicate_split_peer on {dataset_name}: {exc}")
+
     # --- Move the staging folder into its final "BASIC DPG" name ---------
     basic_dir = dataset_out / BASIC_LABEL
     if basic_dir.exists():
@@ -497,6 +514,70 @@ def run_one_dataset(
         "output_dir": dataset_out,
         "artifacts": artifacts,
     }
+
+
+# ---------------------------------------------------------------------------
+# Deduplication pass
+# ---------------------------------------------------------------------------
+
+
+def run_deduplication_pass(
+    run_id: str,
+    dataset_out: pathlib.Path,
+    visualization_config: dict,
+) -> List[pathlib.Path]:
+    """Run ``cat_duplicate_split_peer`` on the conjunction structure.
+
+    Reads the structure JSON produced by ``cat_grouping_split_conjunction``
+    (in the dataset's ``GROUPED-SPLIT-CONJUNCTION DPG/`` subfolder),
+    runs the deduplication, and writes the deduplicated JSON + PNG into
+    a fresh subfolder named ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG/``.
+
+    The source structure in the conjunction subfolder is left
+    untouched. The new subfolder is created (parents included) if it
+    does not already exist. The artefacts the function writes are
+    picked up by the ``rglob`` in ``run_one_dataset`` and logged to
+    W&B alongside the rest.
+
+    Returns the list of files written into the new subfolder, or an
+    empty list if the source structure is missing (in which case
+    ``cat_grouping_split_conjunction`` must have failed earlier in the
+    pipeline and there's nothing to deduplicate).
+    """
+    from categorical import cat_duplicate_split_peer  # local import
+
+    conjunction_dir = dataset_out / CONJUNCTION_LABEL
+    src_structure = (
+        conjunction_dir
+        / f"{run_id}_DPG_split_grouped_conjunction_structure.json"
+    )
+    if not src_structure.is_file():
+        print(
+            f"  [skip] cat_duplicate_split_peer on {run_id}: "
+            f"missing {src_structure.name}"
+        )
+        return []
+
+    dedup_dir = dataset_out / DEDUPLICATED_LABEL
+    dedup_dir.mkdir(parents=True, exist_ok=True)
+    dst_structure = (
+        dedup_dir
+        / f"{run_id}_DPG_split_grouped_conjunction_deduplicated_structure.json"
+    )
+
+    target, n_rewritten, png_target = cat_duplicate_split_peer._process_file(
+        str(src_structure),
+        out_path=str(dst_structure),
+        inplace=False,
+        render=True,
+        visualization_config=visualization_config,
+    )
+    print(
+        f"  [ok]   cat_duplicate_split_peer -> {dedup_dir} "
+        f"({n_rewritten} label(s) rewritten"
+        f", PNG -> {pathlib.Path(png_target).name if png_target else 'n/a'})"
+    )
+    return [p for p in dedup_dir.iterdir() if p.is_file()]
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +699,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes)")
+    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication)")
     print("=" * 64)
     print(f"Start time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Datasets to run:  {len(pairs)}  ({', '.join(name for name, _ in pairs)})")
