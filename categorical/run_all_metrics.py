@@ -3,20 +3,24 @@
 
 Pulls every structure JSON directly from **Weights & Biases** (no local
 output-cache dependency) and computes the 5 user-requested metrics for
-each of the 4 grouping variants the experiments produce.
+each of the 5 grouping variants the experiments produce (4 grouping
+passes + the deduplication post-processing of the conjunction variant).
 
 For each dataset folder under ``DPG/datasets/`` (skipping ``dummy_dataset``):
 
 1. Connect to W&B (project ``dpg-categorical``, entity
    ``mllab-ts-universit-di-trieste``) and pick the **latest finished run**
-   whose ``display_name == dataset_name`` AND that has all four
-   ``dpg_structure`` artifacts attached. The artifacts are produced by
+   whose ``display_name == dataset_name`` AND that has all five
+   ``dpg_structure`` artifacts attached (or use ``--include-incomplete``
+   to accept runs that predate the deduplication pass and only have the
+   original 4 artifacts). The artifacts are produced by
    ``run_all_categorical_experiments.py``'s ``wandb_log_artifacts``:
 
        BASIC_DPG__<dataset>_dpg_structure                (basic DPG)
        GROUPED_DPG__<dataset>_DPG_grouped_structure      (cat_grouping.py)
        GROUPED-SPLIT_DPG__<dataset>_DPG_split_grouped_structure
        GROUPED-SPLIT-CONJUNCTION_DPG__<dataset>_DPG_split_grouped_conjunction_structure
+       GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG__<dataset>_DPG_split_grouped_conjunction_deduplicated_structure
 
 2. Download each ``dpg_structure`` artifact into a per-run cache folder,
    parse the JSON, and compute:
@@ -111,13 +115,16 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "categorical"
 # below; the rest of the pipeline still works on it.
 EXCLUDED_DATASET_DIRS = {"dummy_dataset", "health_insurance"}
 
-# The four variants the experiments produce, in display order. The first
-# entry is the "ground truth" DPG the other three are derived from.
+# The five variants the experiments produce, in display order. The first
+# entry is the "ground truth" DPG the other four are derived from. The
+# deduplicated variant lives at the end because it depends on the
+# conjunction variant existing in the same run.
 VARIANTS: Tuple[Tuple[str, str], ...] = (
     ("BASIC DPG", "BASIC_DPG"),
     ("GROUPED DPG", "GROUPED_DPG"),
     ("GROUPED-SPLIT DPG", "GROUPED-SPLIT_DPG"),
     ("GROUPED-SPLIT-CONJUNCTION DPG", "GROUPED-SPLIT-CONJUNCTION_DPG"),
+    ("GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG", "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG"),
 )
 
 # W&B artifact name fragments per variant. The full artifact name is
@@ -133,11 +140,18 @@ _ARTIFACT_FILE_STEM_BY_VARIANT: Dict[str, str] = {
     "GROUPED_DPG": "_DPG_grouped_structure",
     "GROUPED-SPLIT_DPG": "_DPG_split_grouped_structure",
     "GROUPED-SPLIT-CONJUNCTION_DPG": "_DPG_split_grouped_conjunction_structure",
+    "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG": "_DPG_split_grouped_conjunction_deduplicated_structure",
 }
 
 # Type tag all structure-JSON artifacts use -- lets us find them on a run
 # even if their exact name differs slightly.
 _STRUCTURE_ARTIFACT_TYPE = "dpg_structure"
+
+# W&B artifact *type* tag the deduplication PNG uses, set by
+# ``run_all_categorical_experiments.wandb_log_artifacts`` for any
+# ``*.png`` file. Listed here so a future search-by-type can scope to
+# image artifacts only without hard-coding the string elsewhere.
+_IMAGE_ARTIFACT_TYPE = "dpg_image"
 
 
 # ---------------------------------------------------------------------------
@@ -1192,7 +1206,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--include-incomplete", action="store_true",
-        help="Also accept wandb runs that don't have all 4 structure artifacts (rows will show (missing) for the absent variants).",
+        help="Also accept wandb runs that don't have all 5 structure artifacts (rows will show (missing) for the absent variants). Useful for re-running metrics on a pre-deduplication run that only has the original 4 variants.",
     )
     parser.add_argument(
         "--equiv-samples", type=int, default=200,
@@ -1245,7 +1259,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
 
     print("=" * 64)
-    print("CATEGORICAL DPG METRICS (basic vs 3 grouping variants)")
+    print("CATEGORICAL DPG METRICS (basic vs 4 grouping variants)")
     print("=" * 64)
     print(f"Datasets:        {len(dataset_names)}  ({', '.join(dataset_names)})")
     print(f"W&B project:     {args.project}  (entity: {args.entity or '(account default)'})")
