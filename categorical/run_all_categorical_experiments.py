@@ -265,7 +265,9 @@ def discover_dataset_csvs(
     only_set = set(only) if only else None
     pairs: List[Tuple[str, pathlib.Path]] = []
     for entry in sorted(datasets_dir.iterdir()):
-        if not entry.is_dir() or entry.name in EXCLUDED_DATASET_DIRS:
+        if not entry.is_dir():
+            continue
+        if only_set is None and entry.name in EXCLUDED_DATASET_DIRS:
             continue
         if only_set is not None and entry.name not in only_set:
             continue

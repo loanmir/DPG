@@ -75,3 +75,6 @@ interactive_runs/runs/
 interactive_runs/__pycache__/
 
 # datasets/dummy_dataset
+
+# joblib memmapping scratch (dpg/core.py)
+.joblib_tmp/

@@ -190,7 +190,9 @@ def discover_dataset_names(datasets_dir: pathlib.Path, only: Optional[Sequence[s
     only_set = set(only) if only else None
     names: List[str] = []
     for entry in sorted(datasets_dir.iterdir()):
-        if not entry.is_dir() or entry.name in EXCLUDED_DATASET_DIRS:
+        if not entry.is_dir():
+            continue
+        if only_set is None and entry.name in EXCLUDED_DATASET_DIRS:
             continue
         if not list(entry.glob("*.csv")):
             continue
