@@ -551,14 +551,15 @@ watchdog that stops the run when available RAM drops below 1 GB
 
 | dataset | rows × columns | result |
 |---|---|---|
-| rain_australia | 145,460 × 23 (3,267 rows without a target dropped) | stopped inside `DecisionPredicateGraph.fit` after 7 of 28 trace chunks |
+| rain_australia | 145,460 × 23 (3,267 rows without a target dropped) | stopped inside `DecisionPredicateGraph.fit` after 7 of 28 trace chunks; after 15 of 28 on the retry (~11.4 GB available) |
 | health_insurance | 381,109 × 12 | stopped inside `fit` after 56 of 75 trace chunks |
 
 Neither run got past building the trace log, so there are no graphs, W&B runs or metrics for
-them. Seven idle joblib workers left over from the revision-1 run (started 11:46, from the
-replaced pandas-3 environment) held about 1 GB of RAM and 3.6 GB of swap during both probes.
-Without them the runs would have had somewhat more room. The trace log still has to be built
-whole before `filter_log` runs, so health_insurance may not fit on this machine even then.
+them. During the first two probes, seven idle joblib workers left over from the revision-1 run
+held about 1 GB of RAM and 3.6 GB of swap. With them stopped, rain_australia was retried with
+about 11.4 GB available. It got to chunk 15 of 28 before being stopped, and memory grew steadily
+with each chunk, so it would need roughly twice this machine's RAM. The whole trace log is built
+before `filter_log` runs, so both datasets need a larger machine (e.g. malelab2023).
 `n_jobs: 1` would avoid the per-worker copies but crashes (#16).
 
 Until this revision, `--datasets health_insurance` was silently ignored by both runners: they
