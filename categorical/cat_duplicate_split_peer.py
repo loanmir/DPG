@@ -93,14 +93,25 @@ unchanged -- so it always terminates.
 
 Equivalence guarantee
 ---------------------
-The restricted child clause is always *at least as tight* as the
-original (the new conjunction implies the old one). Combined with
-this pass only ever *dropping* clauses (never adding new constraints)
-and the rewire being a pure no-op for ``v``'s outgoing edges, every
-row that satisfied the original graph still satisfies the modified
-one -- and any row that didn't satisfy the original satisfies the
-modified one even less. The two graphs are therefore exactly
-equivalent on the same dataset: same predicted class for every row.
+On the subset of rows that actually reach the child ``v`` -- i.e. the
+rows that satisfy the parent ``u``'s clause -- the restricted child
+clause is always at least as tight as the original: the rows it admits
+are a subset of (or equal to) the rows the original child admitted
+on that same subset. The simplification loop then either keeps the
+tightened clause, drops the clause outright when the restriction is
+identical to the original (the cosmetic case, e.g. ``parents IN {RENT}
+-> parents IN {RENT} AND ...``), or drops it when the restriction is
+trivially true (``NOT IN {}``). It never adds new constraints. And
+the rewire of a fully-dropped node's incoming edge onto its outgoing
+edges is a pure no-op for ``v``'s outgoing edges.
+
+Net effect: every row that satisfied the original graph still
+satisfies the modified one, and any row that didn't satisfy the
+original satisfies the modified one even less. The two graphs are
+therefore exactly equivalent on the same dataset: same predicted
+class for every row. The change is purely a *label cleanup* -- the
+graph routes the same rows to the same classes; only the cosmetic
+duplication in the displayed child labels is removed.
 
 Numeric predicate nodes (``age <= 25``) and class nodes (``Class 0``)
 are never simplified: they have no IN/NOT IN clauses to start with,
@@ -216,9 +227,12 @@ def _restrict_clause(parent: Clause, child: Clause) -> Optional[Clause]:
 
     Returns the new ``(base, op, cats)`` triple to use for the child,
     or ``None`` to leave the child untouched (different base, no shared
-    condition to fold in). The returned triple is always at least as
-    tight as the original child clause: the rows it admits are a
-    subset of (or equal to) the rows the original child admitted.
+    condition to fold in). On the subset of rows where the parent's
+    clause holds, the returned triple is always at least as tight as
+    the original child clause: the rows it admits are a subset of (or
+    equal to) the rows the original child admitted. The empty-cats
+    case (``NOT IN {}`` -- trivially true, or ``IN {}`` -- trivially
+    false) is handled by the caller, not here.
     """
     base_p, op_p, cats_p = parent
     base_c, op_c, cats_c = child
@@ -331,6 +345,7 @@ def _deduplicate_labels(structure: dict) -> Tuple[dict, int]:
                 # fold in every parent clause, which is out of scope
                 # for this pass.
                 continue
+            base_p, op_p, cats_p = parent_clauses[0]
             child_clauses = _parsed(v)
             if len(child_clauses) <= 1:
                 # Nothing to simplify: child already has 0 or 1 clauses.
@@ -356,6 +371,27 @@ def _deduplicate_labels(structure: dict) -> Tuple[dict, int]:
                     # so it can be debugged if it ever appears in real
                     # data.
                     new_child.append(clause)
+                    continue
+                # Drop the clause outright only if the child clause
+                # is a verbatim duplicate of the parent's -- the
+                # parent's condition alone is enough to satisfy it, so
+                # repeating it in the child is purely cosmetic. This
+                # handles the "parents IN {RENT} -> parents IN {RENT}
+                # AND ..." case where the child literally re-states
+                # the parent. It deliberately does NOT fire when the
+                # child is a strict subset of the parent (e.g. parent
+                # IN {red, blue}, child IN {red}): the child's
+                # narrowing is the binding constraint for the rows
+                # that reach it, and removing it would let through
+                # rows the original graph rejected.
+                base_c_, op_c_, cats_c_ = clause
+                if (
+                    base_c_ == base_p
+                    and op_r == op_c_
+                    and op_p == op_c_
+                    and set(cats_r) == set(cats_p)
+                ):
+                    child_changed = True
                     continue
                 new_child.append(restricted)
                 child_changed = True
