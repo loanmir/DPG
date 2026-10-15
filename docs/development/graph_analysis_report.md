@@ -130,7 +130,7 @@ BASIC:        X_b <= 0.5 -> Y_p > 0.5 -> X_a > 0.5 -> X_c > 0.5 -> Class 1
 CONJUNCTION:  X NOT IN {b} AND Y IN {p} -> Class 1    (the X IN {a, c} test is dropped entirely)
 ```
 
-### 5. Dedup restriction for parent `IN` / child `NOT IN` (latent)
+### 5. Dedup restriction for parent `IN` / child `NOT IN` (latent) - THIS SITUATION SHOULD NOT HAPPEN IN DPG
 
 `cat_duplicate_split_peer._restrict_clause`, case parent `X IN {p}`, child `X NOT IN {c}`: the code
 (and docstring) keep `c \ p`; the values that still matter under the parent are `c ∩ p`.
@@ -140,7 +140,7 @@ _restrict_clause(("X","IN",["a"]), ("X","NOT IN",["a","c"]))  ->  ('X', 'NOT IN'
 correct: ('X', 'NOT IN', ['a'])   (parent X=a, child excludes a: impossible, should stay visible)
 ```
 
-### 6. Dedup ignores the child's other parents (latent)
+### 6. Dedup ignores the child's other parents (latent) - THIS SITUATION DID NOT HAPPEN - IT'S HYPOTETICAL
 
 The dedup pass tightens `v`'s label using the condition of one parent `u`, but never checks whether
 `v` has other incoming edges. The rewritten label is then wrong for every path through the other
@@ -170,7 +170,7 @@ The recent commits work around this by editing dataset values (`Govt_job` → `G
 New datasets will hit it again. The real column list is available at encoding time
 (`pd.get_dummies` input), so the split could use it instead of guessing.
 
-### 8. Cloning makes the "grouped" graphs bigger (observed)
+### 8. Cloning makes the "grouped" graphs bigger (observed) - NORMAL, BECAUSE OF SPLIT/MERGE
 
 The split strategy clones shared nodes so merges don't affect other branches. On adult_subset this
 creates 15 clones in the CONJUNCTION view: **24 → 35 nodes, 33 → 52 edges, 583 → 2080 predicate
