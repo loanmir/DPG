@@ -7,4 +7,5 @@ Technical notes on internal changes, design decisions, and migration guides for 
 
 communities_constraints_update
 graph_analysis_report
+plans/README
 ```

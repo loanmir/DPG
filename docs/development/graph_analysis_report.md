@@ -61,24 +61,29 @@ real rows can follow.
 pipeline's current settings. "Impossible" = no DPG can produce the input (proved from how DPG
 builds edges, and confirmed by the stress test).
 
-| # | Problem | Where | Status | Impact |
-|---|---|---|---|---|
-| 1 | Edge weights are summed when chains are folded | split, conjunction, dedup | **observed** (5/11 datasets) | weights inflated up to 4.5×; edge thickness and weight-based metrics no longer comparable to BASIC |
-| 2 | `explanation_agreement` / `explanation_overlap` are wrong under pandas 3 | `dpg_equivalence.py` | **fixed by the pinned env** (rerun on W&B) | revision 1 reported 0.43–0.59; the rerun gives 1.00 |
-| 3 | Two `IN` tests on the same feature are merged by **union** | grouping, split, conjunction | impossible in GROUPED/SPLIT; **reachable** in CONJUNCTION | an impossible rule becomes a valid one; never touches a satisfiable rule |
-| 4 | Opposite-operator clauses keep the "smaller set" | conjunction `_simplify_same_base` | **reachable** | same as #3: only on contradictions |
-| 5 | Dedup restriction for parent `IN` / child `NOT IN` is wrong | dedup `_restrict_clause` | **reachable**, rare | only on contradictions (hides one); on every satisfiable path the output means the same |
-| 6 | Dedup rewrites a node from one parent's condition while it has others | dedup `_deduplicate_labels` | **reachable** | on real DPGs only downstream of #3/#4; harmless once those are fixed |
-| 7 | One-hot column guessed with `rsplit("_", 1)` | all grouping scripts + `dpg_equivalence.py` | **reachable** (seen on accidents_mining; affected columns in 5 local datasets) | wrong feature/value in labels; numeric tests shown and merged as categories |
-| 8 | Cloning makes the "grouped" graph bigger | split, conjunction | **observed** | adult_subset: 24 → 35 nodes; on other seeds CONJUNCTION hits its iteration cap in 142–146 of 911 graphs, 12–75× larger |
-| 9 | BASIC graphs explain only some classes | original DPG | **observed** (7/11) | e.g. nursery shows 1 of 5 classes |
-| 10 | BASIC graphs contain cycles and contradictory paths | original DPG | **observed** (5/11) | titanic: 61% of paths impossible |
-| 11 | Nursery: 9 of 12 nodes unreachable | original DPG | **observed** | only one usable rule |
-| 12 | `credit_card_visual` duplicates `credit_card_approval` | datasets | **observed** | same graphs, double-counted in aggregates |
-| 13 | Absorbed nodes left in `graph["nodes"]` | `cat_grouping._build_grouped_structure` | **observed** (bank_marketing) | orphan unlabelled node; GROUPED node count off by one per merge |
-| 14 | `discover_dfg` scrambles paths of 16 or more tests | `dpg/core.py` | **observed** (bank_marketing) | the dominant bank_marketing rule is stored with its tests in the wrong order |
-| 15 | GROUPED-SPLIT never finishes on same-feature cycles | `cat_grouping_split.py` | **reachable** (`perc_var` 0.001) | the pass runs to its iteration cap |
-| 16 | `fit` crashes with `n_jobs: 1` | `dpg/core.py` | **observed** (not used by the pipeline) | `ValueError` from `pd.DataFrame` |
+| # | Problem | Where | Status | Impact | Solution ([plans](plans/README.md)) |
+|---|---|---|---|---|---|
+| 1 | Edge weights are summed when chains are folded | split, conjunction, dedup | **observed** (5/11 datasets) | weights inflated up to 4.5×; edge thickness and weight-based metrics no longer comparable to BASIC | [1a](plans/1a.md): a folded edge keeps the weight of the edge it replaces. [1b](plans/1b.md): a clone takes its share of the original's outgoing weight. Together: every view back to 1.00× |
+| 2 | `explanation_agreement` / `explanation_overlap` are wrong under pandas 3 | `dpg_equivalence.py` | **fixed by the pinned env** (rerun on W&B) | revision 1 reported 0.43–0.59; the rerun gives 1.00 | [2a](plans/2a.md): pick categorical columns the way `pd.get_dummies` does (`categorical/onehot.py`), not by dtype |
+| 3 | Two `IN` tests on the same feature are merged by **union** | grouping, split, conjunction | impossible in GROUPED/SPLIT; **reachable** in CONJUNCTION | an impossible rule becomes a valid one; never touches a satisfiable rule | [3a](plans/3a.md): intersect `IN` sets; on an empty intersection keep both clauses (contradiction visible); never merge `IN`→`IN` in GROUPED/SPLIT; same fix in the metric. Optional [3b](plans/3b.md): flag unsatisfiable nodes |
+| 4 | Opposite-operator clauses keep the "smaller set" | conjunction `_simplify_same_base` | **reachable** | same as #3: only on contradictions | [4a](plans/4a.md): `IN (in \ not_in)`; if empty, keep the clauses as they were |
+| 5 | Dedup restriction for parent `IN` / child `NOT IN` is wrong | dedup `_restrict_clause` | **reachable**, rare | only on contradictions (hides one); on every satisfiable path the output means the same | [5a](plans/5a.md): keep `c ∩ p` (two-line fix) |
+| 6 | Dedup rewrites a node from one parent's condition while it has others | dedup `_deduplicate_labels` | **reachable** | on real DPGs only downstream of #3/#4; harmless once those are fixed | [6a](plans/6a.md): rewrite or drop a node only when it has one parent. Optional [6b](plans/6b.md): multi-parent rewrite when all parents agree |
+| 7 | One-hot column guessed with `rsplit("_", 1)` | all grouping scripts + `dpg_equivalence.py` | **reachable** (seen on accidents_mining; affected columns in 5 local datasets) | wrong feature/value in labels; numeric tests shown and merged as categories | [7a](plans/7a.md): store the real one-hot map in the structure JSON and use it in every rewrite and in the metric. Alternative [7b](plans/7b.md): unambiguous `prefix_sep` (changes every label) |
+| 8 | Cloning makes the "grouped" graph bigger | split, conjunction | **observed** | adult_subset: 24 → 35 nodes; on other seeds CONJUNCTION hits its iteration cap in 142–146 of 911 graphs, 12–75× larger | [8a](plans/8a.md): never merge into a node whose *original* id is on a cycle. Cause found: clones of cycle nodes escaped the SCC exclusion (1,207 of 1,352 clones on accidents_mining). With the guard: 34 → 37 nodes instead of 1,386. Optional [8b](plans/8b.md): clone budget / no-clone mode |
+| 9 | BASIC graphs explain only some classes | original DPG | **observed** (7/11) | e.g. nursery shows 1 of 5 classes | [9a](plans/9a.md): report class coverage as a metric. Optional [9b](plans/9b.md): per-class `perc_var` filter |
+| 10 | BASIC graphs contain cycles and contradictory paths | original DPG | **observed** (5/11) | titanic: 61% of paths impossible | [10a](plans/10a.md): measure cycle size and contradictory/redundant path shares per view (no structural fix; inherent to DPG) |
+| 11 | Nursery: 9 of 12 nodes unreachable | original DPG | **observed** | only one usable rule | [11a](plans/11a.md): record where traces start and add a virtual `Start` node to the structure JSON (the degree checks then protect start nodes). Alternative [11b](plans/11b.md): `start_nodes` attribute plus a guard per transformation |
+| 12 | `credit_card_visual` duplicates `credit_card_approval` | datasets | **observed** | same graphs, double-counted in aggregates | [12a](plans/12a.md): exclude from the default runs. Alternative [12b](plans/12b.md): delete (needs the author's OK) |
+| 13 | Absorbed nodes left in `graph["nodes"]` | `cat_grouping._build_grouped_structure` | **observed** (bank_marketing) | orphan unlabelled node; GROUPED node count off by one per merge | [13a](plans/13a.md): also filter absorbed ids out of `graph["nodes"]` |
+| 14 | `discover_dfg` scrambles paths of 16 or more tests | `dpg/core.py` | **observed** (bank_marketing) | the dominant bank_marketing rule is stored with its tests in the wrong order | [14a](plans/14a.md): remove the sort (`groupby` already keeps trace order), then regenerate |
+| 15 | GROUPED-SPLIT never finishes on same-feature cycles | `cat_grouping_split.py` | **reachable** (`perc_var` 0.001) | the pass runs to its iteration cap | [15a](plans/15a.md): 8a's cycle guard in the split script (validated: no cap, BASIC size) |
+| 16 | `fit` crashes with `n_jobs: 1` | `dpg/core.py` | **observed** (not used by the pipeline) | `ValueError` from `pd.DataFrame` | [16a](plans/16a.md): sequential paths return one list per sample, like the parallel path (also fixes the crash in the parallel fallback) |
+
+Each problem has one or more implementation plans in [`plans/`](plans/README.md)
+(`<number><letter>.md`; `a` is the recommended approach). The plans are instructions for coding
+agents: exact files and functions, tests, and acceptance criteria. [`plans/README.md`](plans/README.md)
+gives the execution order and the shared validation tools.
 
 Why #3–#6 only hit impossible rules: on a single tree path the tests are always consistent and
 never redundant (F2 below), so any contradiction on a BASIC path joins edges from different trees.
@@ -392,8 +397,12 @@ not a finished merge. The cap hits 8 of the 10 datasets, all except
 students_dropout_success and titanic. Most hits are at `perc_var` 0.005 (93) and 0.01 (46). The
 pipeline's own settings stay clear of it, but the pipeline seed and tree count (27, 10 trees) at
 `perc_var` 0.005 already hit it on accidents_mining (34 → 1,386 nodes) and adult_subset
-(52 → 1,628). The conjunction script excludes edges inside cycles, so this is not #15's loop
-around a cycle; the cause was not traced further.
+(52 → 1,628). The conjunction script excludes edges inside cycles, but only by the original node
+ids. A merge that enters a cycle from outside makes the absorbing node inherit edges into the
+cycle, and clones of cycle nodes get new ids that the exclusion does not know. So the pass walks
+around the cycle like #15 does. On the accidents_mining case, 1,207 of the 1,352 clones are copies
+of the 24 cycle nodes. Refusing merges into any node whose original id lies on a cycle stops it
+(34 → 37 nodes; see [plan 8a](plans/8a.md)).
 
 ### 13. GROUPED keeps absorbed nodes in `graph["nodes"]` (observed)
 
@@ -537,7 +546,8 @@ from a root can ever reach them (grey dashed nodes in the figure).
 
 ### 12. `credit_card_visual` is a copy of `credit_card_approval`
 
-The CSVs differ by one trailing row, and all five views are identical. If both stay in the
+The CSVs hold the same rows (they differ only by a final newline), and all five views are
+identical. If both stay in the
 benchmark, any average across datasets counts this graph twice.
 
 ---
