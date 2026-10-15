@@ -6,4 +6,5 @@ Technical notes on internal changes, design decisions, and migration guides for 
 :maxdepth: 2
 
 communities_constraints_update
+graph_analysis_report
 ```
