@@ -72,8 +72,10 @@ import matplotlib
 # is not in main loop" tracebacks.
 matplotlib.use("Agg")
 
+import networkx as nx
 import numpy as np
 import pandas as pd
+import sklearn
 import yaml
 from networkx.readwrite import json_graph
 from sklearn.ensemble import RandomForestClassifier
@@ -192,7 +194,17 @@ def wandb_init_for_dataset(dataset_name: str, csv_path: pathlib.Path, offline: b
         group=WANDB_GROUP,
         job_type="basic_dpg_and_grouping",
         name=dataset_name,
-        config={"dataset": dataset_name, "csv": str(csv_path)},
+        config={
+            "dataset": dataset_name,
+            "csv": str(csv_path),
+            # Record the environment: results depend on library versions
+            # (e.g. pandas 3 changed text-column dtypes).
+            "python_version": sys.version.split()[0],
+            "pandas_version": pd.__version__,
+            "numpy_version": np.__version__,
+            "sklearn_version": sklearn.__version__,
+            "networkx_version": nx.__version__,
+        },
         mode=mode,
     )
 
