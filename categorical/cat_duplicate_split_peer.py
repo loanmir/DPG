@@ -55,7 +55,7 @@ parent's condition on the same base:
             only needs to additionally exclude ``c \\ p``)
 
     P = ``base IN {p}``  and  Ci = ``base NOT IN {c}``
-        ->  Ci becomes ``base NOT IN {c \\ p}``
+        ->  Ci becomes ``base NOT IN {c ∩ p}``
             (combined: base must be in p AND not in c, i.e. base in
             p \\ c. Rewritten as a NOT IN clause over c: the values
             in c that the parent never allowed anyway (i.e. c \\ p)
@@ -255,7 +255,7 @@ def _restrict_clause(parent: Clause, child: Clause) -> Optional[Clause]:
     if op_p == "IN" and op_c == "NOT IN":
         # P restricts base to cats_p; Ci additionally excludes cats_c.
         # Combined: base not in (cats_c \ cats_p).
-        new_cats = [c for c in cats_c if c not in cats_p_set]
+        new_cats = [c for c in cats_c if c in cats_p_set]
         return (base_c, "NOT IN", new_cats)
 
     if op_p == "NOT IN" and op_c == "IN":
