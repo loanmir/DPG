@@ -151,12 +151,11 @@ def _simplify_same_base(clauses: List[Clause]) -> List[Clause]:
        adjacent duplicates that the boundary compactor couldn't see.
 
     2. **Same base, opposite operators.** Both clauses compete on the
-       same axis ("which values of ``base`` are allowed here?"). One is
-       implied by the other (the tighter one), so the looser is dead
-       weight. Keep only the tighter (smaller category set); ties favour
-       ``IN`` over ``NOT IN`` because ``base IN {x}`` reads as an explicit
-       positive assertion while ``NOT IN {x}`` carries an implicit domain
-       assumption. Example::
+       same axis ("which values of ``base`` are allowed here?"). The
+       allowed values are ``in \\ not_in``, emitted as one ``IN`` clause;
+       the ``NOT IN`` clause is then implied and dropped. If nothing is
+       allowed, the clauses are kept as they were, because no row can
+       satisfy them and the contradiction should stay visible. Example::
 
            marital NOT IN {divorced}  AND  marital IN {married}
            -> marital IN {married}
@@ -205,13 +204,17 @@ def _simplify_same_base(clauses: List[Clause]) -> List[Clause]:
         in_cats = _dedup(in_cats)
         not_in_cats = _dedup(not_in_cats)
 
-        # Case 2: opposite operators present. Pick the tighter side; drop
-        # the looser one. ``IN`` wins ties for readability.
+        # Case 2: opposite operators present. The allowed values are
+        # ``in \ not_in``; the ``NOT IN`` clause is then implied.
         if in_cats and not_in_cats:
-            if len(not_in_cats) < len(in_cats):
-                in_cats = []  # NOT IN is tighter, drop IN
-            else:
-                not_in_cats = []  # IN is tighter (or ties), drop NOT IN
+            excluded = set(not_in_cats)
+            allowed = [c for c in in_cats if c not in excluded]
+            if not allowed:
+                # Contradiction (every allowed value is excluded): keep this
+                # base's clauses as they were so it stays visible.
+                simplified.extend((base, op, list(cats)) for op, cats in items)
+                continue
+            in_cats, not_in_cats = allowed, []
 
         # Case 1: same-op clauses (now possibly just one operator left)
         # collapse into a single unioned clause.
