@@ -5,8 +5,9 @@
 scikit-learn 1.5.1, networkx 3.3, catboost 1.2.7). Revision 1 ran under pandas 3.0.3, numpy 2.4.6,
 scikit-learn 1.9.0 and Python 3.13. The versions are now stored in each W&B run's config.
 **Scope:** the 11 datasets of `run_all_categorical_experiments.py` (W&B project `dpg-categorical`,
-group `run_all_categorical_basic`). `rain_australia` and `health_insurance` do not fit in this
-machine's RAM (see [Dataset coverage](#dataset-coverage)); `dummy_dataset` is sweep toy data.
+group `run_all_categorical_basic`). `rain_australia` and `health_insurance` ran out of RAM on
+this machine during DPG extraction (see [Dataset coverage](#dataset-coverage)); `dummy_dataset`
+is sweep toy data.
 
 ## What changed in revision 2
 
@@ -23,7 +24,10 @@ machine's RAM (see [Dataset coverage](#dataset-coverage)); `dummy_dataset` is sw
   can happen in CONJUNCTION/DEDUP, but only on paths that were already impossible in BASIC.
 * **Three new problems:** DPG itself scrambles the order of long decision paths (#14, observed:
   it corrupts the dominant rule of `bank_marketing`); GROUPED-SPLIT does not terminate on
-  same-feature cycles (#15); DPG's `n_jobs=1` path crashes (#16).
+  same-feature cycles (#15); DPG's `n_jobs=1` path crashes (#16). In addition, on other seeds the
+  CONJUNCTION pass hits its iteration cap in about 1 graph in 6, with graphs 12–75× larger (#8).
+* **`--datasets health_insurance` now works** (the runners used to drop it silently). Both large
+  datasets were tried and ran out of RAM here.
 
 ## How the graphs were checked
 
@@ -42,7 +46,7 @@ there 5,000 random paths per view were checked instead.
 
 To confirm suspected bugs that the current data does not trigger, the transformation functions
 themselves were called on small hand-built graphs (outputs reproduced below). To find out whether
-real DPGs can trigger them, the same functions were run on GRID_SHORT DPGs generated with the repo's
+real DPGs can trigger them, the same functions were run on 911 DPGs generated with the repo's
 own code (see [the stress test](#stress-test)).
 
 ## Summary
@@ -57,24 +61,29 @@ real rows can follow.
 pipeline's current settings. "Impossible" = no DPG can produce the input (proved from how DPG
 builds edges, and confirmed by the stress test).
 
-| # | Problem | Where | Status | Impact |
-|---|---|---|---|---|
-| 1 | Edge weights are summed when chains are folded | split, conjunction, dedup | **observed** (5/11 datasets) | weights inflated up to 4.5×; edge thickness and weight-based metrics no longer comparable to BASIC |
-| 2 | `explanation_agreement` / `explanation_overlap` are wrong under pandas 3 | `dpg_equivalence.py` | **fixed by the pinned env** (rerun on W&B) | revision 1 reported 0.43–0.59; the rerun gives 1.00 |
-| 3 | Two `IN` tests on the same feature are merged by **union** | grouping, split, conjunction | impossible in GROUPED/SPLIT; **reachable** in CONJUNCTION | an impossible rule becomes a valid one; never touches a satisfiable rule |
-| 4 | Opposite-operator clauses keep the "smaller set" | conjunction `_simplify_same_base` | **reachable** | same as #3: only on contradictions |
-| 5 | Dedup restriction for parent `IN` / child `NOT IN` is wrong | dedup `_restrict_clause` | **reachable**, rare | only on contradictions (hides one); on every satisfiable path the output means the same |
-| 6 | Dedup rewrites a node from one parent's condition while it has others | dedup `_deduplicate_labels` | **reachable** | on real DPGs only downstream of #3/#4; harmless once those are fixed |
-| 7 | One-hot column guessed with `rsplit("_", 1)` | all grouping scripts + `dpg_equivalence.py` | **reachable** (5 local datasets) | wrong feature/value in labels; numeric tests shown and merged as categories |
-| 8 | Cloning makes the "grouped" graph bigger | split, conjunction | **observed** | adult_subset: 24 → 35 nodes; up to 50× on other seeds |
-| 9 | BASIC graphs explain only some classes | original DPG | **observed** (7/11) | e.g. nursery shows 1 of 5 classes |
-| 10 | BASIC graphs contain cycles and contradictory paths | original DPG | **observed** (5/11) | titanic: 61% of paths impossible |
-| 11 | Nursery: 9 of 12 nodes unreachable | original DPG | **observed** | only one usable rule |
-| 12 | `credit_card_visual` duplicates `credit_card_approval` | datasets | **observed** | same graphs, double-counted in aggregates |
-| 13 | Absorbed nodes left in `graph["nodes"]` | `cat_grouping._build_grouped_structure` | **observed** (bank_marketing) | orphan unlabelled node; GROUPED node count off by one per merge |
-| 14 | `discover_dfg` scrambles paths of 16 or more tests | `dpg/core.py` | **observed** (bank_marketing) | the dominant bank_marketing rule is stored with its tests in the wrong order |
-| 15 | GROUPED-SPLIT never finishes on same-feature cycles | `cat_grouping_split.py` | **reachable** (`perc_var` 0.001) | the pass runs to its iteration cap |
-| 16 | `fit` crashes with `n_jobs: 1` | `dpg/core.py` | **observed** (not used by the pipeline) | `ValueError` from `pd.DataFrame` |
+| # | Problem | Where | Status | Impact | Solution ([plans](plans/README.md)) |
+|---|---|---|---|---|---|
+| 1 | Edge weights are summed when chains are folded | split, conjunction, dedup | **observed** (5/11 datasets) | weights inflated up to 4.5×; edge thickness and weight-based metrics no longer comparable to BASIC | [1a](plans/1a.md): a folded edge keeps the weight of the edge it replaces. [1b](plans/1b.md): a clone takes its share of the original's outgoing weight. Together: every view back to 1.00× |
+| 2 | `explanation_agreement` / `explanation_overlap` are wrong under pandas 3 | `dpg_equivalence.py` | **fixed by the pinned env** (rerun on W&B) | revision 1 reported 0.43–0.59; the rerun gives 1.00 | [2a](plans/2a.md): pick categorical columns the way `pd.get_dummies` does (`categorical/onehot.py`), not by dtype |
+| 3 | Two `IN` tests on the same feature are merged by **union** | grouping, split, conjunction | impossible in GROUPED/SPLIT; **reachable** in CONJUNCTION | an impossible rule becomes a valid one; never touches a satisfiable rule | [3a](plans/3a.md): intersect `IN` sets; on an empty intersection keep both clauses (contradiction visible); never merge `IN`→`IN` in GROUPED/SPLIT; same fix in the metric. Optional [3b](plans/3b.md): flag unsatisfiable nodes |
+| 4 | Opposite-operator clauses keep the "smaller set" | conjunction `_simplify_same_base` | **reachable** | same as #3: only on contradictions | [4a](plans/4a.md): `IN (in \ not_in)`; if empty, keep the clauses as they were |
+| 5 | Dedup restriction for parent `IN` / child `NOT IN` is wrong | dedup `_restrict_clause` | **reachable**, rare | only on contradictions (hides one); on every satisfiable path the output means the same | [5a](plans/5a.md): keep `c ∩ p` (two-line fix) |
+| 6 | Dedup rewrites a node from one parent's condition while it has others | dedup `_deduplicate_labels` | **reachable** | on real DPGs only downstream of #3/#4; harmless once those are fixed | [6a](plans/6a.md): rewrite or drop a node only when it has one parent. Optional [6b](plans/6b.md): multi-parent rewrite when all parents agree |
+| 7 | One-hot column guessed with `rsplit("_", 1)` | all grouping scripts + `dpg_equivalence.py` | **reachable** (seen on accidents_mining; affected columns in 5 local datasets) | wrong feature/value in labels; numeric tests shown and merged as categories | [7a](plans/7a.md): store the real one-hot map in the structure JSON and use it in every rewrite and in the metric. Alternative [7b](plans/7b.md): unambiguous `prefix_sep` (changes every label) |
+| 8 | Cloning makes the "grouped" graph bigger | split, conjunction | **observed** | adult_subset: 24 → 35 nodes; on other seeds CONJUNCTION hits its iteration cap in 142–146 of 911 graphs, 12–75× larger | [8a](plans/8a.md): never merge into a node whose *original* id is on a cycle. Cause found: clones of cycle nodes escaped the SCC exclusion (1,207 of 1,352 clones on accidents_mining). With the guard: 34 → 37 nodes instead of 1,386. Optional [8b](plans/8b.md): clone budget / no-clone mode |
+| 9 | BASIC graphs explain only some classes | original DPG | **observed** (7/11) | e.g. nursery shows 1 of 5 classes | [9a](plans/9a.md): report class coverage as a metric. Optional [9b](plans/9b.md): per-class `perc_var` filter |
+| 10 | BASIC graphs contain cycles and contradictory paths | original DPG | **observed** (5/11) | titanic: 61% of paths impossible | [10a](plans/10a.md): measure cycle size and contradictory/redundant path shares per view (no structural fix; inherent to DPG) |
+| 11 | Nursery: 9 of 12 nodes unreachable | original DPG | **observed** | only one usable rule | [11a](plans/11a.md): record where traces start and add a virtual `Start` node to the structure JSON (the degree checks then protect start nodes). Alternative [11b](plans/11b.md): `start_nodes` attribute plus a guard per transformation |
+| 12 | `credit_card_visual` duplicates `credit_card_approval` | datasets | **observed** | same graphs, double-counted in aggregates | [12a](plans/12a.md): exclude from the default runs. Alternative [12b](plans/12b.md): delete (needs the author's OK) |
+| 13 | Absorbed nodes left in `graph["nodes"]` | `cat_grouping._build_grouped_structure` | **observed** (bank_marketing) | orphan unlabelled node; GROUPED node count off by one per merge | [13a](plans/13a.md): also filter absorbed ids out of `graph["nodes"]` |
+| 14 | `discover_dfg` scrambles paths of 16 or more tests | `dpg/core.py` | **observed** (bank_marketing) | the dominant bank_marketing rule is stored with its tests in the wrong order | [14a](plans/14a.md): remove the sort (`groupby` already keeps trace order), then regenerate |
+| 15 | GROUPED-SPLIT never finishes on same-feature cycles | `cat_grouping_split.py` | **reachable** (`perc_var` 0.001) | the pass runs to its iteration cap | [15a](plans/15a.md): 8a's cycle guard in the split script (validated: no cap, BASIC size) |
+| 16 | `fit` crashes with `n_jobs: 1` | `dpg/core.py` | **observed** (not used by the pipeline) | `ValueError` from `pd.DataFrame` | [16a](plans/16a.md): sequential paths return one list per sample, like the parallel path (also fixes the crash in the parallel fallback) |
+
+Each problem has one or more implementation plans in [`plans/`](plans/README.md)
+(`<number><letter>.md`; `a` is the recommended approach). The plans are instructions for coding
+agents: exact files and functions, tests, and acceptance criteria. [`plans/README.md`](plans/README.md)
+gives the execution order and the shared validation tools.
 
 Why #3–#6 only hit impossible rules: on a single tree path the tests are always consistent and
 never redundant (F2 below), so any contradiction on a BASIC path joins edges from different trees.
@@ -126,9 +135,40 @@ dataset's category domains: does the output still mean the same as the input? Wh
 was the input already unsatisfiable (a contradiction gets hidden) or satisfiable (a rule that real
 rows follow changes)? DEDUP is also checked edge by edge against every parent of each rewritten node.
 
-Grid: GRID_DESCRIPTION.
+Grid: 10 datasets (credit_card_visual skipped as a duplicate) × 11 seeds (0–9 and the pipeline's
+27) × 5 / 10 / 20 trees × `perc_var` 0.01 / 0.005 / 0.001 = 990 configurations. 911 of them keep at least
+one path (the other 79 keep none at that `perc_var`). Each is built twice: with DPG's own
+`discover_dfg` ("repo DPG") and with every trace in its true order.
 
-RESULTS_TABLE
+Results for the repo-DPG build. GROUPED/SPLIT rows come from a run with a 5 s limit per view;
+CONJUNCTION/DEDUP rows from a re-run of the whole grid with a 600 s limit. "Reached" counts how often
+the branch ran, "wrong" how often its output meant something different from its input:
+
+| # | branch | reached (graphs) | wrong, input already impossible (graphs) | wrong, satisfiable input (graphs) |
+|---|---|---|---|---|
+| 3 | GROUPED / SPLIT: `IN` ∪ `IN` | 0 | 0 | 0 |
+| 3 | CONJUNCTION: `IN` ∪ `IN` inside one node | 96,085 (126) | 32,479 (66) | 0 |
+| 3 | CONJUNCTION: `IN` ∪ `IN` across a merge boundary | 7,052 (95) | 0 | 0 |
+| 4 | CONJUNCTION: opposite operators | 285,720 (347) | 113,440 (119) | 0 |
+| 5 | DEDUP: parent `IN` / child `NOT IN` | 6 (3) | 1 (1) | 0 |
+| 6 | DEDUP: rewrite of a child with one parent | 10,444 (551) | 1 (1) | 0 |
+| 6 | DEDUP: rewrite of a child with several parents | 15,490 (103) | 585 (39) | **264 (17)** |
+| 6 | same, with #3/#4 fixed (the 18 configurations involved, 54 graphs) | 6,474 (25) | 0 | **0** |
+| – | DEDUP: the other restriction cases (`IN`/`IN`, `NOT IN`/`IN`, `NOT IN`/`NOT IN`) | 11,925 | 0 | 0 |
+| – | DEDUP: CONJUNCTION edges checked for a lost connection | 1,125,171 edges (901) | – | 0 lost |
+| 7 | CONJUNCTION label: numeric column shown as a category | 177 (110) | – | – |
+| 7 | CONJUNCTION label: one-hot column split at the wrong `_` | 331 (147) | – | – |
+
+The true-order build gives the same zeros, the same 17 graphs for #6 (262 changed labels) and
+counts within 20% of the ones above. Other findings of the grid:
+
+* **F2 violations:** 178 edges in 79 graphs of the repo-DPG build, all from #14's scrambled traces;
+  none in the true-order build.
+* **SPLIT did not finish in 5 s** on 220 graphs (209 true-order), the #15 cycles. Its #3 count above
+  covers what ran before the limit; the proof does not depend on it.
+* **CONJUNCTION hit its iteration cap** on 146 graphs (142 true-order) and grew 12–75× (see #8).
+* **CONJUNCTION/DEDUP did not finish in 600 s** on 10 graphs (11 true-order), all at `perc_var`
+  0.001. Their counts stop at the limit.
 
 ---
 
@@ -205,10 +245,13 @@ For `IN` the merged set must be the **intersection**.
   an edge `X_a > 0.5 -> X_b > 0.5`, which F2(a) rules out. The SPLIT relabelling and folding never
   create such an edge either (an `IN` node never absorbs anything, since that would need the same
   edge). Even #14's scrambling can't create one: it only reorders tests from one real path, and
-  no real row satisfies `X = a` and `X = b`. Stress test: 0 occurrences in GROUPED/SPLIT_TOTALS.
+  no real row satisfies `X = a` and `X = b`. Stress test: 0 occurrences in GROUPED and SPLIT
+  over all 911 graphs, in both builds (SPLIT counted up to its 5 s limit on the 220 graphs where
+  #15 kept it running).
 * **CONJUNCTION: yes, often.** Merged nodes collect whole chains across features, so a chain
   `X_a > 0.5 -> Y.. -> X_b > 0.5` built from two trees reaches the union. Stress test:
-  ITEM3_NUMBERS. The input was a contradiction every time. A **satisfiable path can never be
+  the union ran 96,085 times in 126 of the 911 graphs and changed the meaning 32,479 times in
+  66 of them (true order: 101,104 / 123 and 32,905 / 66). The input was a contradiction every time. A **satisfiable path can never be
   changed** by this bug: a satisfiable chain never holds two different `IN` values of one feature.
   The harm is that an impossible rule turns into a valid-looking one, e.g. (accidents_mining,
   seed 27, 10 trees, `perc_var` 0.005): `sex IN {Male} AND sex IN {Female}` → `sex IN {Male, Female}`.
@@ -231,8 +274,9 @@ CONJUNCTION:  X NOT IN {b} AND Y IN {p} -> Class 1    (the X IN {a, c} test is d
 `X_a > 0.5`). It returns a wrong result only on contradictory input. With a satisfiable chain the
 `IN` set is a single value `a` (two values need #3's contradiction) and `a` is not in the
 `NOT IN` set. Keeping `IN {a}` (tie or smaller) is then exactly `IN ({a} \ not_in)`. The second
-example above needs `X_a > 0.5 -> X_c > 0.5`, a contradiction as well. Stress test: ITEM4_NUMBERS,
-always from contradictory input, e.g. `Shift IN {Night} AND Shift NOT IN {Night}` → `Shift IN {Night}`.
+example above needs `X_a > 0.5 -> X_c > 0.5`, a contradiction as well. Stress test: the branch
+ran 285,720 times in 347 graphs and changed the meaning 113,440 times in 119 of them (true order:
+292,252 / 348 and 115,981 / 117), always from contradictory input, e.g. `Shift IN {Night} AND Shift NOT IN {Night}` → `Shift IN {Night}`.
 
 ### 5. Dedup restriction for parent `IN` / child `NOT IN` (harmless on any satisfiable path)
 ### 5. Dedup restriction for parent `IN` / child `NOT IN` (latent) - THIS SITUATION SHOULD NOT HAPPEN IN DPG
@@ -262,7 +306,8 @@ the path is already impossible:
   `X_a > 0.5` never tests X, so the `X NOT IN` clause must come from further down a folded chain
   that switched trees.
 
-Stress test: ITEM5_NUMBERS. The real case (accidents_mining, seed 5, 5 trees, `perc_var` 0.005, true
+Stress test: the branch ran 6 times in 3 of the 911 graphs (both builds) and changed a meaning
+once. That one case (accidents_mining, seed 5, 5 trees, `perc_var` 0.005, true
 trace order): parent `Weather IN {Fog}`, child `Weather NOT IN {Fog} AND Equipment NOT IN {Conveyor}`.
 The child is rewritten to `Equipment NOT IN {Conveyor}`, which hides the contradiction the correct
 rule would keep. With #3/#4 fixed, the branch was never reached in the targeted re-run below.
@@ -281,13 +326,17 @@ after:   v  = X NOT IN {b} AND Y IN {p}      (path via u2 no longer excludes X =
 ```
 
 **Can DPG produce it?** The shape does occur. Cloning in the conjunction pass gives conjunction
-nodes up to 64 parents, and the multi-parent rewrite ran ITEM6_REACHED. It changed a meaning
-ITEM6_WRONG. Some of those parents' CONJUNCTION labels looked satisfiable, but in the examples
-inspected they had already been corrupted by #3/#4 (e.g. `Equipment IN {Truck, Drill}`, the union of
-an impossible `Truck ∧ Drill`). To separate the two effects, every configuration where #6 had
-changed a satisfiable label was re-run with correct #3/#4 (intersection for `IN`; `in \ not_in` for opposite
-operators; contradictions kept visible) and no time limit: the multi-parent rewrite ran 1,028
-times in 10 graphs and **never changed a meaning**. This is expected. The conjunction pass gives a
+nodes up to 64 parents, and the multi-parent rewrite ran 15,490 times in 103 graphs (12,787 in
+100 with the true trace order). It changed a meaning 849 times: 585 times where the parent's label
+was already contradictory (39 graphs), and 264 times where it looked satisfiable (17 graphs:
+accidents_mining 8, nursery 6, bank_marketing 2, adult_subset 1). In the examples inspected, those
+"satisfiable" parent labels had already been corrupted by #3/#4 (e.g. `Equipment IN {Truck, Drill}`,
+the union of an impossible `Truck ∧ Drill`). To separate the two effects, every configuration
+behind those 17 graphs was re-run with correct #3/#4 (intersection for `IN`; `in \ not_in` for
+opposite operators; contradictions kept visible) and a 900 s limit: 18 configurations, all three
+`perc_var` values, 54 graphs. All 17 affected graphs finished. The multi-parent rewrite ran 6,474
+times in 25 graphs (5,711 times in the 17 affected ones) and **never changed a meaning**, neither
+from satisfiable nor from contradictory input. This is expected. The conjunction pass gives a
 node a second parent only by cloning, and a clone carries the clauses the rewrite relies on. **So
 on real DPGs, #6 does harm only on paths #3/#4 have already broken.** The hand-made shape above
 still breaks the standalone CLI on arbitrary JSON, so the `in_degree(v) == 1` guard is still worth
@@ -295,7 +344,7 @@ adding.
 
 Dedup also drops the incoming edges of other parents when it deletes an emptied node (the
 `weights.pop` on the next sweep). The stress test checked every CONJUNCTION edge against DEDUP and
-found no lost connection in DEDUP_EDGES edges.
+found no lost connection in 1,125,171 edges (901 graphs).
 
 ### 7. One-hot columns guessed with `rsplit("_", 1)` (reachable on 5 local datasets)
 
@@ -323,7 +372,12 @@ every column of every local dataset still finds:
 | nursery | one-hot `children_1`, `children_2`, `children_3` | left as `children_1 <= 0.5` (numeric last token) | never grouped (value `more` is) |
 
 The current pipeline graphs happen to avoid all of these (accidents tests `Maintenance_Hours > 2.5`,
-obesity only `MTRANS_Walking`). With other seeds they do appear: ITEM7_NUMBERS. The meaning is
+obesity only `MTRANS_Walking`). With other seeds and tree counts they do appear. Across the
+stress-test grid, an affected column is tested in a BASIC label in 61 of 91 non-empty
+accidents_mining graphs (`Maintenance_Hours`), 49 of 99 credit_card_approval graphs
+(`person_emp_exp`), 68 of 99 nursery graphs (`children_1/2/3`) and 79 of 93 obesity_levels_uci
+graphs (`MTRANS_Public_Transportation`). In CONJUNCTION, a numeric column was written as a category
+177 times (110 graphs), and a one-hot column split at the wrong `_` 331 times (147 graphs). The meaning is
 preserved (the label still maps back to the same column), but the labels are wrong and a numeric
 test ends up inside categorical conjunctions. The real column list is available at encoding time
 (`pd.get_dummies` input), so the split could use it instead of guessing.
@@ -335,6 +389,22 @@ creates 15 clones in the CONJUNCTION view: **24 → 35 nodes, 33 → 52 edges, 5
 characters**, with labels up to 124 characters. On nursery the conjunction view grows from 12 to 14
 nodes, all of the growth inside the unreachable region (#11). This runs against the purpose of
 grouping (a more readable graph) and is worth weighing per dataset.
+
+On other seeds the conjunction pass can also run away. In the stress test, its size relative to
+BASIC splits into two groups with nothing in between. 758 true-order graphs end at most 3.1×
+larger (median 1.0×). The other 142 (146 in the repo-DPG build) hit the pass's iteration cap,
+`10 × (edges + labels + 10)`, and end **12–75× larger** (median 31×): e.g. bank_marketing seed 3,
+5 trees, `perc_var` 0.005, 145 → 4,073 nodes. A capped result is whatever state the loop had reached,
+not a finished merge. The cap hits 8 of the 10 datasets, all except
+students_dropout_success and titanic. Most hits are at `perc_var` 0.005 (93) and 0.01 (46). The
+pipeline's own settings stay clear of it, but the pipeline seed and tree count (27, 10 trees) at
+`perc_var` 0.005 already hit it on accidents_mining (34 → 1,386 nodes) and adult_subset
+(52 → 1,628). The conjunction script excludes edges inside cycles, but only by the original node
+ids. A merge that enters a cycle from outside makes the absorbing node inherit edges into the
+cycle, and clones of cycle nodes get new ids that the exclusion does not know. So the pass walks
+around the cycle like #15 does. On the accidents_mining case, 1,207 of the 1,352 clones are copies
+of the 24 cycle nodes. Refusing merges into any node whose original id lies on a cycle stops it
+(34 → 37 nodes; see [plan 8a](plans/8a.md)).
 
 ### 13. GROUPED keeps absorbed nodes in `graph["nodes"]` (observed)
 
@@ -359,10 +429,13 @@ month NOT IN {apr} -> month NOT IN {aug} -> ... -> month NOT IN {apr}     (10 mo
 job NOT IN {entrepreneur} -> ... -> job NOT IN {entrepreneur}             (6 jobs)
 ```
 
-None of the current pipeline runs hits this (no same-feature cycle at `perc_var` 0.01 / 0.005). In
-the stress test it happened in **SPLIT_TIMEOUT_GRAPHS** of the generated DPGs, all at
-`perc_var = 0.001`. That is the value the pipeline uses for `rain_australia` and
-`health_insurance`. Applying the conjunction script's SCC exclusion to the split script would fix it.
+None of the 11 pipeline graphs has such a cycle. In the stress test, SPLIT did not finish within
+5 s on **209 of the 911 true-order graphs**: 2 of 264 at `perc_var` 0.01, 26 of 317 at 0.005 and 181 of
+330 at 0.001 (0.001 is the value the pipeline uses for `rain_australia` and `health_insurance`). All
+28 cases at 0.01 / 0.005 were re-run without a time limit (`outputs/latent_reachability/split_cycle_check.txt`).
+Every one has a same-feature cycle, and every one ends at the iteration cap after 7–104 s with a
+graph **29–52 times larger** than BASIC (e.g. bank_marketing seed 3: 145 → 4,223 nodes).
+Applying the conjunction script's SCC exclusion to the split script would fix it.
 
 ---
 
@@ -400,7 +473,10 @@ With the true order, the BASIC graph has the same 28 nodes and 29 edges but **4 
 revision 1 (#10) comes from the scrambling: inside one tree a looser test can never follow a tighter
 one (see [F3](#what-a-dpg-edge-can-and-cannot-be)).
 
-In the stress test **SCRAMBLE_SUMMARY**. The fix is one line: drop the sort (`groupby` already keeps
+In the stress test, paths of 16 or more tests survive the `perc_var` filter in 9 of 264 graphs
+at `perc_var` 0.01, 52 of 317 at 0.005 and 208 of 330 at 0.001 (8 of the 10 datasets). They add 189,
+1,984 and 35,863 edges that no tree contains. Only these scrambled builds contain edges that violate F2
+(in 79 graphs). The true-order builds contain none. The fix is one line: drop the sort (`groupby` already keeps
 the row order of each trace) or use `sort_values(..., kind="stable")`. This changes the BASIC
 graphs, so every downstream view and metric should be regenerated afterwards.
 
@@ -472,14 +548,36 @@ from a root can ever reach them (grey dashed nodes in the figure).
 
 ### 12. `credit_card_visual` is a copy of `credit_card_approval`
 
-The CSVs differ by one trailing row, and all five views are identical. If both stay in the
+The CSVs hold the same rows (they differ only by a final newline), and all five views are
+identical. If both stay in the
 benchmark, any average across datasets counts this graph twice.
 
 ---
 
 ## Dataset coverage
 
-DATASET_COVERAGE
+The two datasets the pipeline leaves out by default were run on their own: W&B offline, with a
+watchdog that stops the run when available RAM drops below 1 GB
+(`outputs/latent_reachability/scripts/ram_probe.sh`; this machine has 14 GB RAM, 5 GB swap,
+7 cores). Both use `perc_var` 0.001 and the pipeline's `n_jobs: -1`.
+
+| dataset | rows × columns | result |
+|---|---|---|
+| rain_australia | 145,460 × 23 (3,267 rows without a target dropped) | stopped inside `DecisionPredicateGraph.fit` after 7 of 28 trace chunks; after 15 of 28 on the retry (~11.4 GB available) |
+| health_insurance | 381,109 × 12 | stopped inside `fit` after 56 of 75 trace chunks |
+
+Neither run got past building the trace log, so there are no graphs, W&B runs or metrics for
+them. During the first two probes, seven idle joblib workers left over from the revision-1 run
+held about 1 GB of RAM and 3.6 GB of swap. With them stopped, rain_australia was retried with
+about 11.4 GB available. It got to chunk 15 of 28 before being stopped, and memory grew steadily
+with each chunk, so it would need roughly twice this machine's RAM. The whole trace log is built
+before `filter_log` runs, so both datasets need a larger machine (e.g. malelab2023).
+`n_jobs: 1` would avoid the per-worker copies but crashes (#16).
+
+Until this revision, `--datasets health_insurance` was silently ignored by both runners: they
+applied the default exclusion list before looking at `--datasets`, although `--help` says an
+explicit name overrides it. Both runners now skip `dummy_dataset`/`health_insurance` only when
+`--datasets` is not given.
 
 ---
 
@@ -587,6 +685,8 @@ for ds in $DS; do for s in 27 0 1 2 3 4 5 6 7 8 9; do for t in 5 10 20; do echo 
 python categorical/graph_analysis/latent_reachability.py summary grid
 ```
 
-`VIEW_TIME_LIMIT=900 SKIP_SPLIT=1` re-runs configurations whose CONJUNCTION hit the default 5 s
-limit, and `FIXED_CONJ=1` gives the #6 isolation run. The bug reproductions in problems 3–7 call
+The default limit is 5 s per view. The CONJUNCTION/DEDUP numbers above come from a second pass
+over the whole grid with `VIEW_TIME_LIMIT=600 SKIP_SPLIT=1`, and `FIXED_CONJ=1` gives the #6
+isolation run. The exact sequence used (including the #7 scan and the RAM probes) is
+`outputs/latent_reachability/run_remaining.sh`. The bug reproductions in problems 3–7 call
 the functions in `categorical/` directly on the small graphs shown.
