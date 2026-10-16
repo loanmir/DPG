@@ -30,6 +30,11 @@ import numpy as np
 import pandas as pd
 from networkx.readwrite import json_graph
 
+try:
+    from .onehot import build_onehot_map, categorical_columns, split_one_hot_column
+except ImportError:  # imported as a top-level module (categorical/ on sys.path)
+    from onehot import build_onehot_map, categorical_columns, split_one_hot_column
+
 # Same grammar as categorical/cat_grouping.py's _PREDICATE_PATTERN / _IN_PATTERN.
 _PREDICATE_PATTERN = re.compile(
     r"^\s*(?P<feature>.+?)\s*(?P<op><=|>|<|>=|==|!=)\s*(?P<value>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$"
@@ -160,8 +165,8 @@ def load_categorical_domains(
     drop_columns: Optional[Sequence[str]] = None,
 ) -> Dict[str, frozenset]:
     """Return ``{column_name: frozenset(observed_categories)}`` for every
-    string-typed column in the dataset CSV, after the same
-    drop-columns preprocessing as ``load_eval_rows``.
+    column that ``pd.get_dummies`` one-hot encodes in the dataset CSV,
+    after the same drop-columns preprocessing as ``load_eval_rows``.
 
     Used as the optional ``domains`` argument to ``canonical_constraints``
     / ``dpg_routes`` / ``compare_variants`` so mixed ``IN``/``NOT IN``
@@ -181,14 +186,43 @@ def load_categorical_domains(
         present = [c for c in drop_columns if c in df.columns]
         if present:
             df = df.drop(columns=present)
+    return _domains_from_frame(df)
+
+
+def _domains_from_frame(df: pd.DataFrame) -> Dict[str, frozenset]:
+    """Body of ``load_categorical_domains`` after reading the CSV. The
+    categorical test does not depend on the pandas text dtype (``object``
+    under pandas 2, ``str`` under pandas 3); see ``onehot.categorical_columns``.
+    ``df`` still holds the target column, so a string target gets a
+    domain too."""
     domains: Dict[str, frozenset] = {}
-    for col in df.columns:
-        if not (df[col].dtype == object or str(df[col].dtype).startswith("category")):
-            continue
+    for col in categorical_columns(df):
         values = frozenset(str(v) for v in df[col].dropna().unique())
         if 0 < len(values) <= 1024:
             domains[col] = values
     return domains
+
+
+def load_onehot_map(
+    csv_path: str,
+    drop_columns: Optional[Sequence[str]] = None,
+) -> Dict[str, Tuple[str, str]]:
+    """Return ``{dummy column: (original column, category)}`` for the
+    dataset CSV, after the same preprocessing as ``load_eval_rows``
+    (dropped columns, rows with a missing target removed).
+
+    Used as the optional ``onehot_map`` argument to ``compare_variants``
+    so one-hot dummies are recognised exactly instead of guessed from
+    their names (see ``onehot.build_onehot_map``).
+    """
+    df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
+    if drop_columns:
+        present = [c for c in drop_columns if c in df.columns]
+        if present:
+            df = df.drop(columns=present)
+    target_col = df.columns[-1]
+    df = df.dropna(subset=[target_col]).reset_index(drop=True)
+    return build_onehot_map(df.iloc[:, :-1])
 
 
 def compare_variants(
@@ -198,6 +232,7 @@ def compare_variants(
     nodes_b: Sequence[Tuple[str, str]],
     eval_rows: Sequence[pd.Series],
     domains: Optional[Dict[str, frozenset]] = None,
+    onehot_map: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Dict[str, object]:
     """Full graph-against-graph comparison of two DPG variants.
 
@@ -212,13 +247,18 @@ def compare_variants(
     is invariant to whether a variant emits ``NOT IN {a, b}`` or the
     equivalent ``NOT IN {a} AND IN {b}``.
 
+    ``onehot_map`` (optional, from ``load_onehot_map``) is forwarded the
+    same way; without it one-hot dummies are guessed from their names.
+
     No model is needed -- this compares two graphs to each other, not
     either graph to the RandomForest.
     """
     preds_a = dpg_predictions(graph_a, nodes_a, eval_rows)
     preds_b = dpg_predictions(graph_b, nodes_b, eval_rows)
-    routes_a = [dpg_routes(graph_a, nodes_a, row, domains=domains) for row in eval_rows]
-    routes_b = [dpg_routes(graph_b, nodes_b, row, domains=domains) for row in eval_rows]
+    routes_a = [dpg_routes(graph_a, nodes_a, row, domains=domains, onehot_map=onehot_map)
+                for row in eval_rows]
+    routes_b = [dpg_routes(graph_b, nodes_b, row, domains=domains, onehot_map=onehot_map)
+                for row in eval_rows]
 
     result: Dict[str, object] = {}
     result.update(compute_agreement(preds_a, preds_b))
@@ -356,25 +396,16 @@ def predict_with_dpg(
 # ---------------------------------------------------------------------------
 
 
-def _split_one_hot_column(col: str) -> Optional[Tuple[str, str]]:
-    """``person_home_ownership_OWN`` -> ``('person_home_ownership', 'OWN')``.
-    None for non-OHE columns (no underscore, or a numeric trailing token
-    like ``x_1``). Same rule as cat_grouping._split_one_hot_column."""
-    if "_" not in col:
-        return None
-    base, category = col.rsplit("_", 1)
-    base = base.strip()
-    category = category.strip()
-    if not base or not category:
-        return None
-    try:
-        float(category)
-    except ValueError:
-        return base, category
-    return None
+def _split_one_hot_column(col: str, onehot_map: Optional[dict] = None
+                          ) -> Optional[Tuple[str, str]]:
+    """``person_home_ownership_OWN`` -> ``('person_home_ownership', 'OWN')``,
+    looked up in ``onehot_map``. None for numeric columns. Without a map the
+    split is guessed from the name. Same rule as
+    cat_grouping._split_one_hot_column."""
+    return split_one_hot_column(col, onehot_map)
 
 
-def _canonical_clause(clause: str) -> Optional[tuple]:
+def _canonical_clause(clause: str, onehot_map: Optional[dict] = None) -> Optional[tuple]:
     """Rewrite one clause into a variant-independent form, so the same
     condition written in either grammar compares equal.
 
@@ -399,7 +430,7 @@ def _canonical_clause(clause: str) -> Optional[tuple]:
 
     # A one-hot dummy split at 0.5 is really a categorical membership test
     # -- the exact rewrite cat_grouping._to_categorical_label performs.
-    split = _split_one_hot_column(feature)
+    split = _split_one_hot_column(feature, onehot_map)
     if split is not None and abs(value - 0.5) <= 1e-9:
         base, category = split
         cat_op = "IN" if op in (">", ">=") else "NOT IN"
@@ -411,6 +442,7 @@ def _canonical_clause(clause: str) -> Optional[tuple]:
 def canonical_constraints(
     labels: Sequence[str],
     domains: Optional[Dict[str, frozenset]] = None,
+    onehot_map: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> frozenset:
     """Turn the labels visited along one route into a canonical set of
     constraints.
@@ -447,12 +479,16 @@ def canonical_constraints(
     ``domains`` is keyed by raw column name (e.g. ``"marital"``), not
     by one-hot dummy name (e.g. ``"marital_married"``); see
     ``load_categorical_domains`` for the producer.
+
+    ``onehot_map`` (optional, from ``load_onehot_map``) tells which
+    columns are one-hot dummies in step 1; without it they are guessed
+    from their names.
     """
     cat_buckets: Dict[Tuple[str, str], set] = {}
     others = set()
     for label in labels:
         for clause in str(label).split(" AND "):
-            canon = _canonical_clause(clause.strip())
+            canon = _canonical_clause(clause.strip(), onehot_map)
             if canon is None:
                 continue
             if canon[0] == "cat":
@@ -534,6 +570,7 @@ def dpg_routes(
     sample_row: pd.Series,
     max_routes: int = 500,
     domains: Optional[Dict[str, frozenset]] = None,
+    onehot_map: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> Tuple[set, bool]:
     """Every complete route this sample can take through the graph.
 
@@ -548,6 +585,9 @@ def dpg_routes(
     ``IN``/``NOT IN`` clauses on the same base are NOT collapsed -- the
     metric then reports the SPLIT-CONJUNCTION variant as having different
     routes from BASIC even when they accept the same rows.
+
+    ``onehot_map`` (optional) is forwarded to ``canonical_constraints``
+    as well.
 
     ``max_routes`` caps the enumeration: a densely shared DPG can offer a
     large number of distinct routes for one row, and the flag tells the
@@ -577,7 +617,8 @@ def dpg_routes(
                 next_label = str(label_by_id.get(next_id, ""))
                 if next_label.startswith("Class "):
                     routes.add(
-                        (canonical_constraints(seen_labels, domains=domains), next_label[len("Class "):])
+                        (canonical_constraints(seen_labels, domains=domains, onehot_map=onehot_map),
+                         next_label[len("Class "):])
                     )
                     if len(routes) >= max_routes:
                         return routes, True

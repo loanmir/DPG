@@ -527,6 +527,18 @@ def add_equivalence_metrics(
         print(f"  [equiv] could not load categorical domains: {exc}; falling back to no-domain comparison")
         domains = None
 
+    # The real dummy -> (column, category) map, so one-hot columns are not
+    # guessed from their names. Non-fatal like the domains above.
+    onehot_map: Optional[Dict[str, Tuple[str, str]]] = None
+    try:
+        onehot_map = eq.load_onehot_map(
+            str(csv_path),
+            drop_columns=DROP_COLUMNS_OVERRIDES.get(dataset_name),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [equiv] could not build one-hot map: {exc}; one-hot columns are guessed from their names")
+        onehot_map = None
+
     try:
         base_graph = eq.structure_to_graph(baseline["_structure"])
         base_nodes = eq.real_nodes(baseline["_structure"])
@@ -542,7 +554,8 @@ def add_equivalence_metrics(
             graph = eq.structure_to_graph(metrics["_structure"])
             nodes = eq.real_nodes(metrics["_structure"])
             result = eq.compare_variants(
-                base_graph, base_nodes, graph, nodes, eval_rows, domains=domains
+                base_graph, base_nodes, graph, nodes, eval_rows,
+                domains=domains, onehot_map=onehot_map,
             )
         except Exception as exc:  # noqa: BLE001
             print(f"  [equiv] {variant_label}: failed ({type(exc).__name__}: {exc})")

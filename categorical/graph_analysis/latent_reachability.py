@@ -55,6 +55,7 @@ from categorical import cat_grouping as G1  # noqa: E402
 from categorical import cat_grouping_split as G2  # noqa: E402
 from categorical import cat_grouping_split_conjunction as G3  # noqa: E402
 from categorical import run_all_categorical_experiments as R  # noqa: E402
+from categorical.onehot import build_onehot_map  # noqa: E402
 from dpg.core import DecisionPredicateGraph  # noqa: E402
 
 PERC_VARS = tuple(float(x) for x in os.environ.get("PERC_VARS", "0.01,0.005,0.001").split(","))
@@ -70,7 +71,7 @@ def nid(label):
     return str(int(hashlib.sha1(label.encode()).hexdigest(), 16))
 
 
-def dfg_to_structure(dfg):
+def dfg_to_structure(dfg, onehot_map=None):
     """Mirror generate_dot (edges added in ascending-weight order), to_networkx
     and save_dpg_structure_json."""
     G = nx.DiGraph()
@@ -79,7 +80,10 @@ def dfg_to_structure(dfg):
         labels[nid(a)], labels[nid(b)] = a, b
         G.add_edge(nid(a), nid(b), weight=float(w))
     nodes = [{"id": k, "label": v} for k, v in sorted(labels.items())]
-    return {"nodes": nodes, "graph": json_graph.node_link_data(G)}
+    structure = {"nodes": nodes, "graph": json_graph.node_link_data(G)}
+    if onehot_map is not None:
+        structure["onehot_map"] = {d: [c, v] for d, (c, v) in onehot_map.items()}
+    return structure
 
 
 def true_order_dfg(flog):
@@ -97,6 +101,7 @@ def fit_log(ds, seed, n_trees):
     csv = sorted((R.DEFAULT_DATASETS_DIR / ds).glob("*.csv"))[0]
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         X, y, fn = R.load_dataset(csv, ds)
+        onehot_map = build_onehot_map(R.load_raw_dataset(csv, ds)[0])
         model = RandomForestClassifier(n_estimators=n_trees, random_state=seed)
         _, _, (Xtr, _) = R.train_cv(model, X, y)
         tn = np.unique(y).astype(str).tolist()
@@ -108,7 +113,7 @@ def fit_log(ds, seed, n_trees):
         cap = {}
         dpg.discover_dfg = lambda log: cap.setdefault("log", log) is None or {}
         dpg.fit(Xtr.values)
-    return dpg, cap["log"], list(fn)
+    return dpg, cap["log"], list(fn), onehot_map
 
 
 # --------------------------------------------------------------------------
@@ -291,7 +296,7 @@ def basic_checks(probe, structure, sem):
         m = A.NUM_RE.match(lab)
         if not m or abs(float(m["v"]) - 0.5) > 1e-9:
             continue
-        guess = G1._split_one_hot_column(m["f"])
+        guess = G1._split_one_hot_column(m["f"], structure.get("onehot_map"))
         if m["f"] in sem.onehot and guess != sem.onehot[m["f"]]:
             probe.hit("item7_missplit_label", True, lab)
         elif m["f"] in sem.numeric and guess is not None:
@@ -365,7 +370,7 @@ def run_views(probe, structure, limit=VIEW_TIME_LIMIT):
 
 def run_one(ds, seed, n_trees):
     out = []
-    dpg, log, _ = fit_log(ds, seed, n_trees)
+    dpg, log, _, onehot_map = fit_log(ds, seed, n_trees)
     sem = Sem(ds)
     for pv in PERC_VARS:
         dpg.perc_var = pv
@@ -385,7 +390,7 @@ def run_one(ds, seed, n_trees):
         rec["edges_only_in_dpg"] = len(set(dfg_dpg) - set(dfg_true))
         for tag, dfg in (("dpg", dfg_dpg), ("true_order", dfg_true)):
             probe = Probe(sem)
-            structure = dfg_to_structure(dfg)
+            structure = dfg_to_structure(dfg, onehot_map)
             basic_checks(probe, structure, sem)
             with instrumented(probe), contextlib.redirect_stdout(io.StringIO()):
                 rec[f"{tag}_sizes"] = run_views(probe, structure)

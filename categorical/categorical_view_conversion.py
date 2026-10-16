@@ -14,9 +14,10 @@ is rewritten to a single set-membership label of the form::
 
     <base_feature> \u2208 {<CATEGORY>}  (e.g. ``person_home_ownership \u2208 {OWN}``)
 
-where ``<base_feature>`` is the prefix (everything before the last ``_`` of the
-feature column name) and ``<CATEGORY>`` is the trailing value of the encoded
-column.
+where ``<base_feature>`` is the original column of the dummy and
+``<CATEGORY>`` its encoded value, both looked up in the structure's
+``onehot_map``. Structures without the map fall back to guessing from the
+name (everything before / after the last ``_``), with a warning.
 
 The output PNG keeps the **same name** as the original graph (just placed
 inside ``wip/``) and is rendered as PNG only (no PDF, no communities plot).
@@ -48,6 +49,11 @@ from networkx.readwrite import json_graph
 
 from dpg.visualizer import plot_dpg
 
+try:
+    from .onehot import split_one_hot_column
+except ImportError:  # imported as a top-level module (categorical/ on sys.path)
+    from onehot import split_one_hot_column
+
 
 # ---------------------------------------------------------------------------
 # Heuristics for detecting one-hot encoded categorical predicates
@@ -59,31 +65,20 @@ _PREDICATE_PATTERN = re.compile(
 )
 
 
-def _split_one_hot_column(col: str) -> Optional[Tuple[str, str]]:
-    """Split a one-hot encoded column name into ``(base_feature, category)``.
+def _split_one_hot_column(col: str, onehot_map: Optional[dict] = None
+                          ) -> Optional[Tuple[str, str]]:
+    """Split a one-hot encoded column name into ``(base_feature, category)``
+    by looking it up in ``onehot_map`` (the structure's ``onehot_map``).
+    ``None`` is returned for numeric columns.
 
-    We treat the *last* underscore-separated token as the category and the
-    rest as the base feature. ``None`` is returned when the column is clearly
-    not a one-hot encoded categorical (no underscore, or the prefix is
-    empty / the suffix looks numeric).
+    Without a map (legacy JSONs) the *last* underscore-separated token is
+    guessed to be the category, which mis-splits names like
+    ``job_self_employed`` and treats numeric ``has_loan`` as a dummy.
     """
-    if "_" not in col:
-        return None
-    base, category = col.rsplit("_", 1)
-    base = base.strip()
-    category = category.strip()
-    if not base or not category:
-        return None
-    # Avoid splitting genuinely numeric features such as ``x_1`` or ``col_42``.
-    try:
-        float(category)
-        return None
-    except ValueError:
-        pass
-    return base, category
+    return split_one_hot_column(col, onehot_map)
 
 
-def _is_categorical_predicate(label: str) -> bool:
+def _is_categorical_predicate(label: str, onehot_map: Optional[dict] = None) -> bool:
     """``True`` when the label looks like a one-hot encoded categorical
     predicate, i.e. ``feature_CAT op 0.5``."""
     parsed = _PREDICATE_PATTERN.match(label)
@@ -91,7 +86,7 @@ def _is_categorical_predicate(label: str) -> bool:
         return False
     feature = parsed.group("feature")
     value = float(parsed.group("value"))
-    if not _split_one_hot_column(feature):
+    if not _split_one_hot_column(feature, onehot_map):
         return False
     # One-hot encoded columns are typically split on a 0.5 threshold.
     if abs(value - 0.5) > 1e-9:
@@ -99,7 +94,7 @@ def _is_categorical_predicate(label: str) -> bool:
     return True
 
 
-def _to_categorical_label(label: str) -> str:
+def _to_categorical_label(label: str, onehot_map: Optional[dict] = None) -> str:
     """Convert a one-hot predicate label to a set-membership label.
 
     Example::
@@ -114,7 +109,7 @@ def _to_categorical_label(label: str) -> str:
     if parsed is None:
         return label
     feature, op, value = parsed.group("feature"), parsed.group("op"), parsed.group("value")
-    split = _split_one_hot_column(feature)
+    split = _split_one_hot_column(feature, onehot_map)
     if split is None or abs(float(value) - 0.5) > 1e-9:
         return label
     base, category = split
@@ -139,12 +134,15 @@ def _build_label_map(structure: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Return ``(id -> new_label, id -> old_label)`` for every node in the
     structure payload.
     """
+    onehot_map = structure.get("onehot_map")
+    if onehot_map is None:
+        print("[warn] structure has no onehot_map; one-hot columns are guessed from their names")
     new_labels: Dict[str, str] = {}
     old_labels: Dict[str, str] = {}
     for node in structure.get("nodes", []):
         node_id = str(node["id"])
         old_label = str(node.get("label", ""))
-        new_labels[node_id] = _to_categorical_label(old_label)
+        new_labels[node_id] = _to_categorical_label(old_label, onehot_map)
         old_labels[node_id] = old_label
     return new_labels, old_labels
 

@@ -89,6 +89,7 @@ REPO_ROOT = SCRIPT_DIR.parent  # DPG/
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from categorical.onehot import build_onehot_map, categorical_columns  # noqa: E402
 from dpg import DPGExplainer  # noqa: E402
 from metrics.graph import GraphMetrics  # noqa: E402
 
@@ -284,14 +285,14 @@ def discover_dataset_csvs(
     return pairs
 
 
-def load_dataset(csv_path: pathlib.Path, dataset_name: str):
-    """Load a CSV, split features/labels, one-hot encode the features.
+def load_raw_dataset(csv_path: pathlib.Path, dataset_name: str):
+    """Load a CSV and split it into raw (not yet encoded) features and labels.
 
     The target column is assumed to be the last CSV column (true for every
     dataset under ``DPG/datasets/``). Columns listed in
-    ``DROP_COLUMNS_OVERRIDES`` (IDs / near-unique free text) are dropped
-    before encoding. The delimiter (``,`` vs ``;``) is auto-detected since
-    datasets in this repo use both.
+    ``DROP_COLUMNS_OVERRIDES`` (IDs / near-unique free text) are dropped.
+    The delimiter (``,`` vs ``;``) is auto-detected since datasets in this
+    repo use both.
     """
     df = pd.read_csv(csv_path, sep=None, engine="python", encoding="utf-8-sig")
 
@@ -309,11 +310,23 @@ def load_dataset(csv_path: pathlib.Path, dataset_name: str):
 
     features = df.iloc[:, :-1]
     labels = df.iloc[:, -1]
+    return features, labels
 
+
+def encode_features(features: pd.DataFrame):
+    """One-hot encode raw features; returns ``(features_enc, feature_names)``."""
     features_enc = pd.get_dummies(features, drop_first=False)
     features_enc = features_enc.replace([np.inf, -np.inf], np.nan).fillna(features_enc.mean())
     features_enc = np.round(features_enc, 3)
     feature_names = list(features_enc.columns)
+    return features_enc, feature_names
+
+
+def load_dataset(csv_path: pathlib.Path, dataset_name: str):
+    """Load a CSV, split features/labels, one-hot encode the features
+    (``load_raw_dataset`` followed by ``encode_features``)."""
+    features, labels = load_raw_dataset(csv_path, dataset_name)
+    features_enc, feature_names = encode_features(features)
     return features_enc, labels, feature_names
 
 
@@ -346,7 +359,7 @@ def _json_default(value):
 
 
 def save_dpg_structure_json(explanation, out_path: pathlib.Path, run_id: str,
-                             feature_names, target_names) -> None:
+                             feature_names, target_names, onehot_map=None) -> None:
     graph_data = json_graph.node_link_data(explanation.graph)
     labeled_nodes = [{"id": nid, "label": lab} for nid, lab in explanation.nodes]
     payload = {
@@ -357,6 +370,10 @@ def save_dpg_structure_json(explanation, out_path: pathlib.Path, run_id: str,
         "nodes": labeled_nodes,
         "graph": graph_data,
     }
+    if onehot_map is not None:
+        # Read by the grouping scripts so dummy columns are not guessed
+        # from their names (see categorical/onehot.py).
+        payload["onehot_map"] = {dummy: [col, cat] for dummy, (col, cat) in onehot_map.items()}
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
 
@@ -413,7 +430,17 @@ def run_one_dataset(
     staging_dir = dataset_out / run_id
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    X, y, feature_names = load_dataset(csv_path, dataset_name)
+    features_raw, y = load_raw_dataset(csv_path, dataset_name)
+    X, feature_names = encode_features(features_raw)
+    onehot_map = build_onehot_map(features_raw)
+    cat_cols = set(categorical_columns(features_raw))
+    numeric_cols = {c for c in features_raw.columns if c not in cat_cols}
+    if set(feature_names) != set(onehot_map) | numeric_cols:
+        raise ValueError(
+            f"{dataset_name}: one-hot map does not match the encoded features "
+            f"(only in features: {sorted(set(feature_names) - set(onehot_map) - numeric_cols)}, "
+            f"only in map/numeric: {sorted((set(onehot_map) | numeric_cols) - set(feature_names))})"
+        )
 
     model = RandomForestClassifier(n_estimators=NUM_TREES, random_state=RANDOM_STATE)
     acc, f1, (X_train, y_train) = train_cv(model, X, y)
@@ -439,6 +466,7 @@ def run_one_dataset(
         run_id,
         feature_names,
         target_names,
+        onehot_map=onehot_map,
     )
     with open(staging_dir / f"{run_id}_dpg_class_boundaries.txt", "w") as f:
         for key, value in explanation.class_boundaries.items():
