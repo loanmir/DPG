@@ -31,9 +31,9 @@ import pandas as pd
 from networkx.readwrite import json_graph
 
 try:
-    from .onehot import build_onehot_map, categorical_columns, split_one_hot_column
+    from .onehot import MISSING_CATEGORY, build_onehot_map, categorical_columns, split_one_hot_column
 except ImportError:  # imported as a top-level module (categorical/ on sys.path)
-    from onehot import build_onehot_map, categorical_columns, split_one_hot_column
+    from onehot import MISSING_CATEGORY, build_onehot_map, categorical_columns, split_one_hot_column
 
 # Same grammar as categorical/cat_grouping.py's _PREDICATE_PATTERN / _IN_PATTERN.
 _PREDICATE_PATTERN = re.compile(
@@ -199,6 +199,12 @@ def _domains_from_frame(df: pd.DataFrame) -> Dict[str, frozenset]:
     for col in categorical_columns(df):
         values = frozenset(str(v) for v in df[col].dropna().unique())
         if 0 < len(values) <= 1024:
+            # A missing value is one more possible value of the column
+            # (all-zero dummies). The NEGATIVE / POSITIVE variants spell it
+            # out in their labels (``x IN {a, nan}``), so it must be part of
+            # the domain for their routes to canonicalise like BASIC's.
+            if df[col].isna().any():
+                values = values | {MISSING_CATEGORY}
             domains[col] = values
     return domains
 

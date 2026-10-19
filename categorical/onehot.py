@@ -43,6 +43,25 @@ def categorical_columns(df: pd.DataFrame) -> List[str]:
     return categorical
 
 
+# How a missing categorical value is written inside an ``IN``/``NOT IN``
+# label. It is what ``str()`` of a missing value read by ``pd.read_csv``
+# (a float NaN) gives, which is how ``dpg_equivalence`` evaluates labels.
+MISSING_CATEGORY = "nan"
+
+
+def missing_value_columns(features: pd.DataFrame) -> List[str]:
+    """Categorical columns of ``features`` with at least one missing value.
+
+    ``pd.get_dummies(drop_first=False)`` encodes a missing value as all-zero
+    dummies: for such a row every ``base NOT IN {...}`` holds and every
+    ``base IN {...}`` fails. Rewriting one operator into the other is only
+    exact if the missing value is counted as one more category of ``base``
+    (``MISSING_CATEGORY``), so the pipeline records these columns in the
+    structure JSON as ``missing_categorical``.
+    """
+    return [c for c in categorical_columns(features) if features[c].isna().any()]
+
+
 def build_onehot_map(features: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
     """``{dummy column: (original column, category)}`` for every column that
     ``pd.get_dummies(features, drop_first=False)`` creates. The original column
