@@ -16,7 +16,10 @@ script:
    ``cat_grouping_split_conjunction`` output to drop the parent/
    child clause redundancies that cross-feature conjunction splitting
    can leave behind, and renders the deduplicated graph.
-4. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in five fixed
+4. Runs ``cat_NEGATIVE_peer.py`` on the deduplicated output to rewrite
+   every ``IN`` clause as the equivalent ``NOT IN`` over the attribute's
+   remaining categories, and renders the negative graph.
+5. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in six fixed
    subfolders:
 
      * ``BASIC DPG``                                -- the raw DPGExplainer output
@@ -24,6 +27,7 @@ script:
      * ``GROUPED-SPLIT DPG``                        -- cat_grouping_split.py output
      * ``GROUPED-SPLIT-CONJUNCTION DPG``            -- cat_grouping_split_conjunction.py output
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG`` -- cat_duplicate_split_peer.py output (deduplicated JSON + PNG)
+     * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG`` -- cat_NEGATIVE_peer.py output (NOT IN-only JSON + PNG)
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
@@ -118,6 +122,7 @@ GROUPED_LABEL = "GROUPED DPG"
 SPLIT_LABEL = "GROUPED-SPLIT DPG"
 CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUNCTION DPG"
 DEDUPLICATED_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG"
+NEGATIVE_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG"
 
 # The three grouping scripts to run against each basic DPG structure,
 # keyed by their importable module name (relative to the ``categorical``
@@ -544,6 +549,15 @@ def run_one_dataset(
     except Exception as exc:  # noqa: BLE001 - report and continue
         print(f"  [err]  cat_duplicate_split_peer on {dataset_name}: {exc}")
 
+    # --- Negative pass: read the GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED
+    # output and rewrite it with NOT IN clauses only. Same direct-call
+    # pattern as the deduplication pass; its JSON + PNG land in their own
+    # subfolder and are picked up by the rglob below.
+    try:
+        run_negative_pass(run_id, dataset_out, visualization_config)
+    except Exception as exc:  # noqa: BLE001 - report and continue
+        print(f"  [err]  cat_NEGATIVE_peer on {dataset_name}: {exc}")
+
     # --- Move the staging folder into its final "BASIC DPG" name ---------
     basic_dir = dataset_out / BASIC_LABEL
     if basic_dir.exists():
@@ -627,6 +641,72 @@ def run_deduplication_pass(
         f", PNG -> {pathlib.Path(png_target).name if png_target else 'n/a'})"
     )
     return [p for p in dedup_dir.iterdir() if p.is_file()]
+
+
+# ---------------------------------------------------------------------------
+# Negative pass
+# ---------------------------------------------------------------------------
+
+
+def run_negative_pass(
+    run_id: str,
+    dataset_out: pathlib.Path,
+    visualization_config: dict,
+) -> List[pathlib.Path]:
+    """Run ``cat_NEGATIVE_peer`` on the deduplicated structure.
+
+    Reads the structure JSON produced by ``run_deduplication_pass`` (in
+    the dataset's ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG/``
+    subfolder), rewrites every ``IN`` clause as ``NOT IN``, and writes
+    the negative JSON + PNG into a fresh subfolder named
+    ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG/``.
+
+    Returns the list of files written into the new subfolder, or an
+    empty list if the deduplicated structure is missing (the
+    deduplication pass must have failed earlier in the pipeline).
+    """
+    from categorical import cat_NEGATIVE_peer  # local import
+
+    dedup_dir = dataset_out / DEDUPLICATED_LABEL
+    src_structure = (
+        dedup_dir
+        / f"{run_id}_DPG_split_grouped_conjunction_deduplicated_structure.json"
+    )
+    if not src_structure.is_file():
+        print(
+            f"  [skip] cat_NEGATIVE_peer on {run_id}: "
+            f"missing {src_structure.name}"
+        )
+        return []
+
+    negative_dir = dataset_out / NEGATIVE_LABEL
+    # The folder belongs to this pass only: clear it so files left by an
+    # earlier run under another name are not uploaded to W&B again.
+    if negative_dir.exists():
+        shutil.rmtree(negative_dir)
+    negative_dir.mkdir(parents=True, exist_ok=True)
+    # Short file name on purpose: W&B rejects artifact names over 128
+    # characters, and the artifact name is ``<folder>__<file stem>``. The
+    # long ``..._split_grouped_conjunction_deduplicated_negative`` stem
+    # pushed every dataset name longer than 13 characters over the limit.
+    # The PNG takes its name from this JSON (``<run_id>_DPG_negative.png``).
+    dst_structure = negative_dir / f"{run_id}_DPG_negative_structure.json"
+
+    target, n_rewritten, problems, png_target = cat_NEGATIVE_peer._process_file(
+        str(src_structure),
+        out_path=str(dst_structure),
+        inplace=False,
+        render=True,
+        visualization_config=visualization_config,
+    )
+    print(
+        f"  [ok]   cat_NEGATIVE_peer -> {negative_dir} "
+        f"({n_rewritten} label(s) rewritten"
+        f", PNG -> {pathlib.Path(png_target).name if png_target else 'n/a'})"
+    )
+    for problem in problems:
+        print(f"  [warn] cat_NEGATIVE_peer: {problem}")
+    return [p for p in negative_dir.iterdir() if p.is_file()]
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +828,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication)")
+    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication + negative)")
     print("=" * 64)
     print(f"Start time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Datasets to run:  {len(pairs)}  ({', '.join(name for name, _ in pairs)})")
