@@ -364,7 +364,8 @@ def _build_grouped_structure(
     """Rebuild the ``structure`` dict after the IN/NOT-IN rewrite and the
     sequential grouping pass.
 
-    Nodes whose ids appear in ``collapsed_ids`` are dropped (they have been
+    Nodes whose ids appear in ``collapsed_ids`` are dropped, both from the
+    top-level ``nodes`` list and from ``graph["nodes"]`` (they have been
     absorbed by the leader of their merged run). Surviving nodes keep every
     original field but have their ``label`` replaced by the value in
     ``grouped_labels``. Edges are taken from ``grouped_weights`` (the
@@ -417,6 +418,10 @@ def _build_grouped_structure(
     new_structure["nodes"] = new_nodes
     if "graph" in new_structure:
         new_graph = dict(new_structure["graph"])
+        new_graph["nodes"] = [
+            n for n in new_graph.get("nodes", [])
+            if str(n.get("id", "")) not in collapsed_ids
+        ]
         new_graph["edges"] = new_edges
         new_graph["links"] = new_edges
         new_structure["graph"] = new_graph
