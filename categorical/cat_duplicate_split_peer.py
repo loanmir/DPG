@@ -80,9 +80,10 @@ parent's condition on the same base:
         data issue rather than a redundancy).
 
 A node whose label becomes empty is removed and its single incoming
-edge is rewired onto its outgoing edges with the original edge
-weights summed (matching the rest of the project's split-then-merge
-convention).
+edge is rewired onto its outgoing edges, which keep their own weights
+(matching the rest of the project's split-then-merge convention). Where
+the parent already had a direct edge to the same target, the two weights
+add up: those are different traces.
 
 The pass iterates until a full sweep makes no change: simplifying
 ``v``'s label can turn a downstream edge ``v -> w`` into a redundancy
@@ -183,6 +184,7 @@ from dpg.visualizer import plot_dpg  # noqa: E402
 
 from cat_grouping import (  # noqa: E402
     _format_in_label,
+    _format_weight,
     _load_visualization_config,
     _parse_in_label,
 )
@@ -402,9 +404,8 @@ def _deduplicate_labels(structure: dict) -> Tuple[dict, int]:
             # --- Update v's label (or drop v if it's now empty) -------
             if not new_child:
                 # Drop v; rewire its incoming edge onto its outgoing
-                # edges with the original edge weights summed. Matches
-                # the project's split-then-merge fold convention.
-                w_uv = weights[(u, v)]
+                # edges, which keep their own weights. Matches the
+                # project's split-then-merge fold convention.
                 for (s, d), w in list(weights.items()):
                     if s != v:
                         continue
@@ -414,7 +415,7 @@ def _deduplicate_labels(structure: dict) -> Tuple[dict, int]:
                         continue
                     del weights[(s, d)]
                     key = (u, d)
-                    weights[key] = weights.get(key, 0.0) + w + w_uv
+                    weights[key] = weights.get(key, 0.0) + w
                 del weights[(u, v)]
                 labels.pop(v, None)
                 # Drop v from the structure's nodes and the graph's
@@ -559,7 +560,7 @@ def _build_dot_from_graph(
         )
 
     for (src, dst), weight in sorted(edges.items(), key=lambda kv: kv[1], reverse=True):
-        dot.edge(src, dst, label=str(weight), penwidth="1", fontsize="18")
+        dot.edge(src, dst, label=_format_weight(weight), penwidth="1", fontsize="18")
 
     return dot
 

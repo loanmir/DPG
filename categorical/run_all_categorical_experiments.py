@@ -511,6 +511,7 @@ def run_one_dataset(
         )
 
     # --- Three grouping passes, each reading the staged structure JSON ---
+    conj_capped = False
     for module_name, label in GROUPING_MODULES:
         out_dir = dataset_out / label
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -526,6 +527,11 @@ def run_one_dataset(
             print(f"  [skip] {module_name} on {dataset_name}: no structure JSON")
         else:
             print(f"  [ok]   {module_name} -> {out_dir}")
+        stats = getattr(module, "LAST_RUN_STATS", None)
+        if out_png is not None and stats and stats.get("capped"):
+            print(f"  [warn] {module_name} hit its iteration cap on {dataset_name}")
+            if label == CONJUNCTION_LABEL:
+                conj_capped = True
 
     # --- Deduplication pass: read the GROUPED-SPLIT-CONJUNCTION output --
     # The deduplication script has a different API from the three grouping
@@ -553,6 +559,7 @@ def run_one_dataset(
         "n_nodes": n_nodes,
         "n_edges": n_edges,
         "n_communities": n_comms,
+        "conj_capped": conj_capped,
         "output_dir": dataset_out,
         "artifacts": artifacts,
     }
@@ -805,6 +812,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "n_nodes": info["n_nodes"],
                     "n_edges": info["n_edges"],
                     "n_communities": info["n_communities"],
+                    "conj_capped": info["conj_capped"],
                 })
             except Exception as exc:  # noqa: BLE001
                 print(f"  [wandb] log failed: {exc}")

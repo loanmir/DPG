@@ -25,13 +25,14 @@ instead of refusing to merge:
   child ``v`` can still be relabelled in place to show the union of
   categories (edge weight untouched), *provided* ``v`` belongs to ``u``
   alone. If ``v`` is also shared by other parents, a private copy of ``v``
-  is cloned first (identical label + outgoing edges), so the original ``v``
-  is left completely untouched for its other parents, and the clone is what
-  gets relabelled.
+  is cloned first (identical label and outgoing edges, carrying the share of
+  ``v``'s outgoing traffic that arrives through ``u``), so the original
+  ``v`` keeps its label and the rest of the traffic for its other parents,
+  and the clone is what gets relabelled.
 * If the parent ``u`` has exactly one outgoing edge (to ``v``), the merge is
   identical to ``cat_grouping``'s strict rule: ``u`` absorbs ``v`` (cloning
   it first if ``v`` is shared), ``u``'s id survives with the combined label,
-  and the weight folds forward onto whatever comes after ``v``.
+  and ``v``'s outgoing edges move onto ``u`` unchanged.
 
 The run is iterative and continues until no adjacent same-base/same-op pair
 remains, so chains of length 3+ still collapse to a single node exactly as
@@ -81,6 +82,7 @@ from dpg.visualizer import plot_dpg
 from .cat_grouping import (
     _build_label_map,
     _format_in_label,
+    _format_weight,
     _iter_subdirs,
     _load_structure_json,
     _load_visualization_config,
@@ -138,34 +140,40 @@ def _split_then_merge(
             in_count[d] = in_count.get(d, 0) + 1
         return out_count, in_count
 
-    def _clone_node(v: str) -> str:
-        """Private copy of ``v``: same label, same *current* outgoing
-        edges. Nothing points to it yet -- the caller wires up its single
-        incoming edge."""
+    def _clone_node(v: str, w_in: float) -> str:
+        """Private copy of ``v`` for one incoming edge of weight ``w_in``:
+        same label, and the share ``w_in / (v's total incoming weight)``
+        of each of ``v``'s *current* outgoing edges, which ``v`` itself
+        gives up. The total weight leaving ``v`` and its clone together
+        stays what it was. Nothing points to the clone yet -- the caller
+        wires up its single incoming edge."""
         nonlocal clone_counter
         clone_counter += 1
         v_copy = f"{v}#{clone_counter}"
         labels[v_copy] = labels[v]
+        in_w = sum(w for (_, d), w in edges.items() if d == v)
+        share = min(1.0, w_in / in_w) if in_w > 0 else 0.0
         for (s, d), w in list(edges.items()):
             if s == v:
-                edges[(v_copy, d)] = edges.get((v_copy, d), 0.0) + w
+                edges[(v_copy, d)] = edges.get((v_copy, d), 0.0) + w * share
+                edges[(s, d)] = w * (1.0 - share)
         return v_copy
 
     def _fold_forward(
-        u: str, target: str, w_uv: float, base: str, op: str,
+        u: str, target: str, base: str, op: str,
         cats_u: List[str], cats_v: List[str],
     ) -> None:
         """``u`` absorbs ``target`` (``v`` or a private clone of it): the
         label combines, ``target``'s outgoing edges move onto ``u`` with
-        ``w_uv`` folded into each, and ``target`` disappears. Requires
-        ``edges[(u, target)] == w_uv`` to already be the case."""
+        their own weight, and ``target`` disappears. Requires the edge
+        ``(u, target)`` to already exist."""
         labels[u] = _format_in_label(base, op, cats_u + cats_v)
         del edges[(u, target)]
         for (s, d), w in list(edges.items()):
             if s == target:
                 del edges[(s, d)]
                 key = (u, d)
-                edges[key] = edges.get(key, 0.0) + w + w_uv
+                edges[key] = edges.get(key, 0.0) + w
         labels.pop(target, None)
 
     max_iterations = 10 * (len(edges) + len(labels) + 10)
@@ -193,10 +201,10 @@ def _split_then_merge(
             if in_count.get(v, 0) == 1:
                 target = v
             else:
-                target = _clone_node(v)
+                target = _clone_node(v, w_uv)
                 del edges[(u, v)]
                 edges[(u, target)] = w_uv
-            _fold_forward(u, target, w_uv, base, op, pu[2], pv[2])
+            _fold_forward(u, target, base, op, pu[2], pv[2])
         elif in_count.get(v, 0) == 1:
             # v belongs to u alone: merge in place, weight untouched.
             labels[v] = _format_in_label(base, op, pu[2] + pv[2])
@@ -205,7 +213,7 @@ def _split_then_merge(
             # Both shared: clone v privately for u's branch and merge into
             # the clone, leaving the original v untouched for its other
             # parents.
-            v_copy = _clone_node(v)
+            v_copy = _clone_node(v, w_uv)
             labels[v_copy] = _format_in_label(base, op, pu[2] + pv[2])
             del edges[(u, v)]
             edges[(u, v_copy)] = w_uv
@@ -273,7 +281,7 @@ def _build_dot_from_graph(
         )
 
     for (src, dst), weight in sorted(edges.items(), key=lambda kv: kv[1], reverse=True):
-        dot.edge(src, dst, label=str(weight), penwidth="1", fontsize="18")
+        dot.edge(src, dst, label=_format_weight(weight), penwidth="1", fontsize="18")
 
     return dot
 

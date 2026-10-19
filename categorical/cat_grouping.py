@@ -27,9 +27,10 @@ of the one-hot-to-IN/NOT-IN rewrite:
        loan_intent NOT IN {PERSONAL}  ->  loan_intent NOT IN {VENTURE}  ->  Class 0
                                           (edge weight 56)              (weight 212)
 
-   becomes::
+   becomes (the merged node's outgoing edge keeps the weight of the
+   edge leaving the run's tail: the same traces flow along the whole chain)::
 
-       loan_intent NOT IN {PERSONAL, VENTURE}  ->  Class 0      (weight 56 + 212 = 268)
+       loan_intent NOT IN {PERSONAL, VENTURE}  ->  Class 0      (weight 212)
 
    The grouping walk is iterative: any run of length > 2 collapses in one
    pass, and the resulting merged node can still be merged with the next
@@ -66,6 +67,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 import graphviz
+import networkx as nx
 import pandas as pd
 from networkx.readwrite import json_graph
 
@@ -161,6 +163,27 @@ def _parse_in_label(label: str) -> Optional[Tuple[str, str, List[str]]]:
 
 
 # ---------------------------------------------------------------------------
+# Cycle helpers (shared by the split scripts)
+# ---------------------------------------------------------------------------
+
+def _original_id(node_id: str) -> str:
+    """Id of the BASIC node a (possibly cloned) node comes from: clones are
+    named ``<id>#<n>`` and clones of clones ``<id>#<n>#<m>``."""
+    return node_id.split("#", 1)[0]
+
+
+def _cycle_node_ids(nx_graph) -> Set[str]:
+    """Ids of the nodes that lie on a cycle of ``nx_graph`` (members of a
+    strongly connected component with more than one node)."""
+    return {
+        str(n)
+        for component in nx.strongly_connected_components(nx_graph)
+        if len(component) > 1
+        for n in component
+    }
+
+
+# ---------------------------------------------------------------------------
 # Graph rebuilding helpers
 # ---------------------------------------------------------------------------
 
@@ -201,6 +224,11 @@ def _format_in_label(base: str, op: str, cats: List[str]) -> str:
     return f"{base} {op} {{{', '.join(deduped)}}}"
 
 
+def _format_weight(weight: float) -> str:
+    """Edge label for a (possibly fractional) trace count."""
+    return f"{weight:.0f}" if abs(weight - round(weight)) < 1e-9 else f"{weight:.2f}"
+
+
 def _apply_grouping(
     structure: dict,
     label_map: Dict[str, str],
@@ -223,9 +251,10 @@ def _apply_grouping(
     instead of merging, so a run is always the longest *simple* chain
     available -- matching the "branching nodes break the chain" rule.
 
-    The run's merged outgoing edge(s) carry every weight the run absorbs:
-    the edges internal to the run *and* the edge(s) leaving the run's tail
-    node to whatever comes next (a Class node or another predicate).
+    The run's outgoing edges keep the weight of the tail's outgoing edges,
+    because the same traces flow along the whole private chain; the edges
+    internal to the run are dropped, not added on (that would count the
+    same traces once per edge of the run).
 
     Returns
     -------
@@ -307,9 +336,6 @@ def _apply_grouping(
             merged_cats.extend(parsed_map[nid][2])
         grouped_labels[head] = _format_in_label(base, op, merged_cats)
 
-        internal_sum = sum(
-            weight_map.get((run[k], run[k + 1]), 0.0) for k in range(len(run) - 1)
-        )
         for k in range(len(run) - 1):
             grouped_weights.pop((run[k], run[k + 1]), None)
 
@@ -319,7 +345,7 @@ def _apply_grouping(
             original = grouped_weights.pop(key, weight_map.get(key, 0.0))
             new_key = (head, nxt)
             grouped_weights[new_key] = (
-                grouped_weights.get(new_key, 0.0) + original + internal_sum
+                grouped_weights.get(new_key, 0.0) + original
             )
 
     return grouped_labels, grouped_weights, collapsed_ids
@@ -341,8 +367,8 @@ def _build_grouped_structure(
     Nodes whose ids appear in ``collapsed_ids`` are dropped (they have been
     absorbed by the leader of their merged run). Surviving nodes keep every
     original field but have their ``label`` replaced by the value in
-    ``grouped_labels``. Edges are taken from ``grouped_weights`` (which
-    already sums the absorbed weights onto the leader's outgoing edge);
+    ``grouped_labels``. Edges are taken from ``grouped_weights`` (the
+    leader's outgoing edges carry the tail's weights);
     any edge whose endpoints were absorbed is filtered out. Non-endpoint
     metadata (e.g. link ``id``) is preserved by looking the link up in
     the original ``edges``/``links`` list.
@@ -472,7 +498,8 @@ def _build_dot(
         )
 
     # Second pass: emit edges in weight-descending order using the
-    # *grouped* weight map (collapsed-segment weights have been summed).
+    # *grouped* weight map (a collapsed run's outgoing edges keep the
+    # weights of its tail's outgoing edges).
     sorted_edges = sorted(
         grouped_weights.items(),
         key=lambda kv: kv[1],
@@ -484,7 +511,7 @@ def _build_dot(
         dot.edge(
             src,
             dst,
-            label=str(weight),
+            label=_format_weight(weight),
             penwidth="1",
             fontsize="18",
         )

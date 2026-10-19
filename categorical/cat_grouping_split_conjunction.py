@@ -44,11 +44,15 @@ IN {PERSONAL}`` genuinely exists in about a third of the bundled examples.
 restriction meant such a cross-feature loop could never be walked in the
 first place. Here it can, and folding/cloning around a real cycle has no
 fixed point -- it just keeps growing. So before merging anything, this
-script computes strongly connected components of the raw graph and
-permanently excludes any edge whose endpoints are in the same non-trivial
-component: those nodes are left exactly as the one-hot rewrite produced
+script finds every node that lies on a cycle of the raw graph (a member of
+a strongly connected component with more than one node) and never merges
+into such a node, identified by its original id so clones of cycle nodes
+count too: those nodes are left exactly as the one-hot rewrite produced
 them, un-grouped, while every acyclic part of the graph still gets grouped
-as aggressively as described above.
+as aggressively as described above. Refusing only the edges *inside* a
+cycle is not enough: a node outside that merges into a cycle node inherits
+its edges around the cycle, under new ids, and keeps walking. Merges *out*
+of a cycle stay allowed, since they lead away from it and terminate.
 
 Everything else -- the split-then-merge mechanics (cloning a shared node
 rather than refusing to merge), the three merge cases (parent absorbs
@@ -84,7 +88,6 @@ sys.path.insert(0, PROJECT_ROOT)
 sys.path.insert(0, SCRIPT_DIR)
 
 import graphviz
-import networkx as nx
 import pandas as pd
 from networkx.readwrite import json_graph
 
@@ -94,14 +97,23 @@ from dpg.visualizer import plot_dpg
 # cat_grouping.py instead of re-implementing them here.
 from .cat_grouping import (
     _build_label_map,
+    _cycle_node_ids,
     _format_in_label,
+    _format_weight,
     _iter_subdirs,
     _load_structure_json,
     _load_visualization_config,
+    _original_id,
     _parse_in_label,
 )
 
 Clause = Tuple[str, str, List[str]]  # (base, op, cats)
+
+# Outcome of the most recent ``_split_then_merge`` call: ``capped`` (the
+# loop hit its iteration cap and the result is unfinished), ``iterations``,
+# ``clones`` and ``max_iterations``. Kept outside the return value so the
+# ``(labels, edges)`` signature the runners unpack stays unchanged.
+LAST_RUN_STATS: Dict[str, object] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -290,20 +302,10 @@ def _split_then_merge(
 
     # Cross-feature merging can walk all the way around a real cycle (see
     # module docstring) with no fixed point, since folding/cloning never
-    # makes progress on a loop. Find every strongly connected component of
-    # size > 1 up front and permanently refuse to merge across its edges --
-    # those nodes stay exactly as the one-hot rewrite produced them.
-    scc_id: Dict[str, int] = {}
-    scc_size: Dict[int, int] = {}
-    for i, component in enumerate(nx.strongly_connected_components(nx_graph)):
-        component = {str(n) for n in component}
-        scc_size[i] = len(component)
-        for n in component:
-            scc_id[n] = i
-    for (u0, v0) in edges:
-        cid = scc_id.get(u0)
-        if cid is not None and cid == scc_id.get(v0) and scc_size[cid] > 1:
-            settled.add((u0, v0))
+    # makes progress on a loop. Find every node that lies on a cycle up
+    # front; the loop below never merges into one of them (or a clone of
+    # one) -- those nodes stay exactly as the one-hot rewrite produced them.
+    cycle_nodes = _cycle_node_ids(nx_graph)
 
     clone_counter = 0
 
@@ -315,25 +317,31 @@ def _split_then_merge(
             in_count[d] = in_count.get(d, 0) + 1
         return out_count, in_count
 
-    def _clone_node(v: str) -> str:
-        """Private copy of ``v``: same label, same clauses, same *current*
-        outgoing edges. Nothing points to it yet -- the caller wires up its
-        single incoming edge."""
+    def _clone_node(v: str, w_in: float) -> str:
+        """Private copy of ``v`` for one incoming edge of weight ``w_in``:
+        same label, same clauses, and the share ``w_in / (v's total incoming
+        weight)`` of each of ``v``'s *current* outgoing edges, which ``v``
+        itself gives up. The total weight leaving ``v`` and its clone
+        together stays what it was. Nothing points to the clone yet -- the
+        caller wires up its single incoming edge."""
         nonlocal clone_counter
         clone_counter += 1
         v_copy = f"{v}#{clone_counter}"
         labels[v_copy] = labels[v]
         clauses[v_copy] = list(clauses[v])
+        in_w = sum(w for (_, d), w in edges.items() if d == v)
+        share = min(1.0, w_in / in_w) if in_w > 0 else 0.0
         for (s, d), w in list(edges.items()):
             if s == v:
-                edges[(v_copy, d)] = edges.get((v_copy, d), 0.0) + w
+                edges[(v_copy, d)] = edges.get((v_copy, d), 0.0) + w * share
+                edges[(s, d)] = w * (1.0 - share)
         return v_copy
 
-    def _fold_forward(u: str, target: str, w_uv: float) -> None:
+    def _fold_forward(u: str, target: str) -> None:
         """``u`` absorbs ``target`` (``v`` or a private clone of it): the
         clauses combine, ``target``'s outgoing edges move onto ``u`` with
-        ``w_uv`` folded into each, and ``target`` disappears. Requires
-        ``edges[(u, target)] == w_uv`` to already be the case."""
+        their own weight, and ``target`` disappears. Requires the edge
+        ``(u, target)`` to already exist."""
         clauses[u] = _combine_clauses(clauses[u], clauses[target])
         labels[u] = _format_clauses(clauses[u])
         del edges[(u, target)]
@@ -341,12 +349,14 @@ def _split_then_merge(
             if s == target:
                 del edges[(s, d)]
                 key = (u, d)
-                edges[key] = edges.get(key, 0.0) + w + w_uv
+                edges[key] = edges.get(key, 0.0) + w
         labels.pop(target, None)
         clauses.pop(target, None)
 
     max_iterations = 10 * (len(edges) + len(labels) + 10)
-    for _ in range(max_iterations):
+    capped = False
+    iterations = 0
+    for iterations, _ in enumerate(range(max_iterations), start=1):
         out_count, in_count = _degrees()
 
         candidate = None
@@ -354,6 +364,12 @@ def _split_then_merge(
             if (u, v) in settled:
                 continue
             if u not in clauses or v not in clauses:
+                settled.add((u, v))
+                continue
+            if _original_id(v) in cycle_nodes:
+                # Merging into a cycle node lets u inherit edges that lead around
+                # the cycle; the clones they produce are not in the cycle-node set
+                # under their new ids, so the walk never ends (report #8).
                 settled.add((u, v))
                 continue
             candidate = (u, v, w_uv)
@@ -368,10 +384,10 @@ def _split_then_merge(
             if in_count.get(v, 0) == 1:
                 target = v
             else:
-                target = _clone_node(v)
+                target = _clone_node(v, w_uv)
                 del edges[(u, v)]
                 edges[(u, target)] = w_uv
-            _fold_forward(u, target, w_uv)
+            _fold_forward(u, target)
         elif in_count.get(v, 0) == 1:
             # v belongs to u alone: merge in place, weight untouched.
             clauses[v] = _combine_clauses(clauses[u], clauses[v])
@@ -381,18 +397,26 @@ def _split_then_merge(
             # Both shared: clone v privately for u's branch and merge into
             # the clone, leaving the original v untouched for its other
             # parents.
-            v_copy = _clone_node(v)
+            v_copy = _clone_node(v, w_uv)
             clauses[v_copy] = _combine_clauses(clauses[u], clauses[v])
             labels[v_copy] = _format_clauses(clauses[v_copy])
             del edges[(u, v)]
             edges[(u, v_copy)] = w_uv
             settled.add((u, v_copy))
     else:
+        capped = True
         print(
             "  [warn] split-then-merge hit its iteration cap "
             f"({max_iterations}); the input graph may contain a cycle."
         )
 
+    LAST_RUN_STATS.clear()
+    LAST_RUN_STATS.update(
+        capped=capped,
+        iterations=iterations,
+        clones=clone_counter,
+        max_iterations=max_iterations,
+    )
     return labels, edges
 
 
@@ -450,7 +474,7 @@ def _build_dot_from_graph(
         )
 
     for (src, dst), weight in sorted(edges.items(), key=lambda kv: kv[1], reverse=True):
-        dot.edge(src, dst, label=str(weight), penwidth="1", fontsize="18")
+        dot.edge(src, dst, label=_format_weight(weight), penwidth="1", fontsize="18")
 
     return dot
 
@@ -549,6 +573,7 @@ def _process_subdir(
     print(f"  [ok]   {run_id} -> {out_path}")
 
     split_structure = _build_split_structure(structure, labels, edges)
+    split_structure["grouping_status"] = dict(LAST_RUN_STATS)
     split_json_path = os.path.join(wip_dir, f"{output_name}_structure.json")
     with open(split_json_path, "w", encoding="utf-8") as fh:
         json.dump(split_structure, fh, indent=2, ensure_ascii=False)
