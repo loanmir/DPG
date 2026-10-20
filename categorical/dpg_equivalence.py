@@ -460,10 +460,17 @@ def canonical_constraints(
        ``_canonical_clause``), so one-hot and ``IN``/``NOT IN``
        spellings of the same test collapse together.
     2. Clauses on the same feature with the same operator are merged
-       by unioning their categories -- exactly what ``cat_grouping``'s
-       chain collapsing does. So BASIC visiting ``X NOT IN {OWN}``
-       then ``X NOT IN {RENT}`` as two separate nodes yields the same
-       constraint as GROUPED's single ``X NOT IN {OWN, RENT}`` node.
+       into one, the way a route requires all of them to hold. ``NOT IN``
+       clauses merge by unioning their categories -- exactly what
+       ``cat_grouping``'s chain collapsing does. So BASIC visiting
+       ``X NOT IN {OWN}`` then ``X NOT IN {RENT}`` as two separate nodes
+       yields the same constraint as GROUPED's single
+       ``X NOT IN {OWN, RENT}`` node. ``IN`` clauses merge by
+       intersecting their categories: ``X IN {OWN, RENT}`` then
+       ``X IN {RENT, MORTGAGE}`` only admits ``RENT``. (Routes of the
+       POSITIVE variant, whose labels are all ``IN``, regularly cross
+       the same feature twice; a union there would drop both
+       constraints and the route would never match BASIC's.)
     3. (Optional, only when ``domains`` is supplied.) Mixed
        ``IN``/``NOT IN`` clauses on the same feature are intersected
        against the feature's full category set, then re-emitted as a
@@ -499,7 +506,13 @@ def canonical_constraints(
                 continue
             if canon[0] == "cat":
                 _, base, op, cats = canon
-                cat_buckets.setdefault((base, op), set()).update(cats)
+                key = (base, op)
+                if key not in cat_buckets:
+                    cat_buckets[key] = set(cats)
+                elif op == "NOT IN":
+                    cat_buckets[key] |= cats  # not in A and not in B: not in A ∪ B
+                else:
+                    cat_buckets[key] &= cats  # in A and in B: in A ∩ B
             else:
                 others.add(canon)
 

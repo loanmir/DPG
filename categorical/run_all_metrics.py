@@ -3,17 +3,17 @@
 
 Pulls every structure JSON directly from **Weights & Biases** (no local
 output-cache dependency) and computes the 5 user-requested metrics for
-each of the 6 grouping variants the experiments produce (4 grouping
+each of the 7 grouping variants the experiments produce (4 grouping
 passes + the deduplication post-processing of the conjunction variant +
-the NOT IN-only rewrite of the deduplicated variant).
+the NOT IN-only and IN-only rewrites of the deduplicated variant).
 
 For each dataset folder under ``DPG/datasets/`` (skipping ``dummy_dataset``):
 
 1. Connect to W&B (project ``dpg-categorical``, entity
    ``mllab-ts-universit-di-trieste``) and pick the **latest finished run**
-   whose ``display_name == dataset_name`` AND that has all six
+   whose ``display_name == dataset_name`` AND that has all seven
    ``dpg_structure`` artifacts attached (or use ``--include-incomplete``
-   to accept runs that predate the deduplication / negative passes and
+   to accept runs that predate the deduplication / negative / positive passes and
    only have some of them). The artifacts are produced by
    ``run_all_categorical_experiments.py``'s ``wandb_log_artifacts``:
 
@@ -23,6 +23,7 @@ For each dataset folder under ``DPG/datasets/`` (skipping ``dummy_dataset``):
        GROUPED-SPLIT-CONJUNCTION_DPG__<dataset>_DPG_split_grouped_conjunction_structure
        GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG__<dataset>_DPG_split_grouped_conjunction_deduplicated_structure
        GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE_DPG__<dataset>_DPG_negative_structure
+       GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE_DPG__<dataset>_DPG_positive_structure
 
 2. Download each ``dpg_structure`` artifact into a per-run cache folder,
    parse the JSON, and compute:
@@ -117,10 +118,10 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "outputs" / "categorical"
 # below; the rest of the pipeline still works on it.
 EXCLUDED_DATASET_DIRS = {"dummy_dataset", "health_insurance"}
 
-# The six variants the experiments produce, in display order. The first
-# entry is the "ground truth" DPG the other five are derived from. The
+# The seven variants the experiments produce, in display order. The first
+# entry is the "ground truth" DPG the other six are derived from. The
 # deduplicated variant comes after the conjunction variant it is built
-# from, and the negative variant after the deduplicated one.
+# from, and the negative / positive variants after the deduplicated one.
 VARIANTS: Tuple[Tuple[str, str], ...] = (
     ("BASIC DPG", "BASIC_DPG"),
     ("GROUPED DPG", "GROUPED_DPG"),
@@ -128,6 +129,7 @@ VARIANTS: Tuple[Tuple[str, str], ...] = (
     ("GROUPED-SPLIT-CONJUNCTION DPG", "GROUPED-SPLIT-CONJUNCTION_DPG"),
     ("GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG", "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG"),
     ("GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG", "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE_DPG"),
+    ("GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE DPG", "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE_DPG"),
 )
 
 # W&B artifact name fragments per variant. The full artifact name is
@@ -145,8 +147,9 @@ _ARTIFACT_FILE_STEM_BY_VARIANT: Dict[str, str] = {
     "GROUPED-SPLIT-CONJUNCTION_DPG": "_DPG_split_grouped_conjunction_structure",
     "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED_DPG": "_DPG_split_grouped_conjunction_deduplicated_structure",
     # Shorter than the other stems so the full artifact name stays under
-    # W&B's 128-character limit (see ``run_negative_pass``).
+    # W&B's 128-character limit (see ``run_single_operator_pass``).
     "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE_DPG": "_DPG_negative_structure",
+    "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE_DPG": "_DPG_positive_structure",
 }
 
 # Type tag all structure-JSON artifacts use -- lets us find them on a run
@@ -1227,7 +1230,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--include-incomplete", action="store_true",
-        help="Also accept wandb runs that don't have all 6 structure artifacts (rows will show (missing) for the absent variants). Useful for re-running metrics on a run that predates the deduplication / negative passes.",
+        help="Also accept wandb runs that don't have all 7 structure artifacts (rows will show (missing) for the absent variants). Useful for re-running metrics on a run that predates the deduplication / negative / positive passes.",
     )
     parser.add_argument(
         "--equiv-samples", type=int, default=200,

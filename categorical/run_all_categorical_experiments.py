@@ -16,10 +16,11 @@ script:
    ``cat_grouping_split_conjunction`` output to drop the parent/
    child clause redundancies that cross-feature conjunction splitting
    can leave behind, and renders the deduplicated graph.
-4. Runs ``cat_NEGATIVE_peer.py`` on the deduplicated output to rewrite
-   every ``IN`` clause as the equivalent ``NOT IN`` over the attribute's
-   remaining categories, and renders the negative graph.
-5. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in six fixed
+4. Runs ``cat_NEGATIVE_peer.py`` and ``cat_POSITIVE_peer.py`` on the
+   deduplicated output to rewrite every categorical clause as the
+   equivalent ``NOT IN`` (resp. ``IN``) over the attribute's remaining
+   categories, and renders both graphs.
+5. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in seven fixed
    subfolders:
 
      * ``BASIC DPG``                                -- the raw DPGExplainer output
@@ -28,6 +29,7 @@ script:
      * ``GROUPED-SPLIT-CONJUNCTION DPG``            -- cat_grouping_split_conjunction.py output
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG`` -- cat_duplicate_split_peer.py output (deduplicated JSON + PNG)
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG`` -- cat_NEGATIVE_peer.py output (NOT IN-only JSON + PNG)
+     * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE DPG`` -- cat_POSITIVE_peer.py output (IN-only JSON + PNG)
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
@@ -93,7 +95,11 @@ REPO_ROOT = SCRIPT_DIR.parent  # DPG/
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from categorical.onehot import build_onehot_map, categorical_columns  # noqa: E402
+from categorical.onehot import (  # noqa: E402
+    build_onehot_map,
+    categorical_columns,
+    missing_value_columns,
+)
 from dpg import DPGExplainer  # noqa: E402
 from metrics.graph import GraphMetrics  # noqa: E402
 
@@ -123,6 +129,7 @@ SPLIT_LABEL = "GROUPED-SPLIT DPG"
 CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUNCTION DPG"
 DEDUPLICATED_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG"
 NEGATIVE_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG"
+POSITIVE_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE DPG"
 
 # The three grouping scripts to run against each basic DPG structure,
 # keyed by their importable module name (relative to the ``categorical``
@@ -364,7 +371,8 @@ def _json_default(value):
 
 
 def save_dpg_structure_json(explanation, out_path: pathlib.Path, run_id: str,
-                             feature_names, target_names, onehot_map=None) -> None:
+                             feature_names, target_names, onehot_map=None,
+                             missing_categorical=None) -> None:
     graph_data = json_graph.node_link_data(explanation.graph)
     labeled_nodes = [{"id": nid, "label": lab} for nid, lab in explanation.nodes]
     payload = {
@@ -379,6 +387,11 @@ def save_dpg_structure_json(explanation, out_path: pathlib.Path, run_id: str,
         # Read by the grouping scripts so dummy columns are not guessed
         # from their names (see categorical/onehot.py).
         payload["onehot_map"] = {dummy: [col, cat] for dummy, (col, cat) in onehot_map.items()}
+    if missing_categorical is not None:
+        # Categorical columns with missing values (all-zero dummies). Read
+        # by cat_NEGATIVE_peer / cat_POSITIVE_peer, which count the missing
+        # value as one more category when rewriting IN <-> NOT IN.
+        payload["missing_categorical"] = [str(c) for c in missing_categorical]
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, default=_json_default)
 
@@ -472,6 +485,7 @@ def run_one_dataset(
         feature_names,
         target_names,
         onehot_map=onehot_map,
+        missing_categorical=missing_value_columns(features_raw),
     )
     with open(staging_dir / f"{run_id}_dpg_class_boundaries.txt", "w") as f:
         for key, value in explanation.class_boundaries.items():
@@ -549,14 +563,17 @@ def run_one_dataset(
     except Exception as exc:  # noqa: BLE001 - report and continue
         print(f"  [err]  cat_duplicate_split_peer on {dataset_name}: {exc}")
 
-    # --- Negative pass: read the GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED
-    # output and rewrite it with NOT IN clauses only. Same direct-call
-    # pattern as the deduplication pass; its JSON + PNG land in their own
-    # subfolder and are picked up by the rglob below.
-    try:
-        run_negative_pass(run_id, dataset_out, visualization_config)
-    except Exception as exc:  # noqa: BLE001 - report and continue
-        print(f"  [err]  cat_NEGATIVE_peer on {dataset_name}: {exc}")
+    # --- Negative / positive passes: read the GROUPED-SPLIT-CONJUNCTION-
+    # DEDUPLICATED output and rewrite it with NOT IN (resp. IN) clauses
+    # only. Same direct-call pattern as the deduplication pass; each JSON +
+    # PNG lands in its own subfolder and is picked up by the rglob below.
+    for module_name, label, tag in SINGLE_OPERATOR_PASSES:
+        try:
+            run_single_operator_pass(
+                run_id, dataset_out, visualization_config, module_name, label, tag
+            )
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            print(f"  [err]  {module_name} on {dataset_name}: {exc}")
 
     # --- Move the staging folder into its final "BASIC DPG" name ---------
     basic_dir = dataset_out / BASIC_LABEL
@@ -644,28 +661,38 @@ def run_deduplication_pass(
 
 
 # ---------------------------------------------------------------------------
-# Negative pass
+# Single-operator passes (NEGATIVE / POSITIVE)
 # ---------------------------------------------------------------------------
 
+# (module, output subfolder, file tag) for each pass, run in this order.
+SINGLE_OPERATOR_PASSES: Tuple[Tuple[str, str, str], ...] = (
+    ("cat_NEGATIVE_peer", NEGATIVE_LABEL, "negative"),
+    ("cat_POSITIVE_peer", POSITIVE_LABEL, "positive"),
+)
 
-def run_negative_pass(
+
+def run_single_operator_pass(
     run_id: str,
     dataset_out: pathlib.Path,
     visualization_config: dict,
+    module_name: str,
+    label: str,
+    tag: str,
 ) -> List[pathlib.Path]:
-    """Run ``cat_NEGATIVE_peer`` on the deduplicated structure.
+    """Run ``cat_NEGATIVE_peer`` or ``cat_POSITIVE_peer`` on the
+    deduplicated structure.
 
     Reads the structure JSON produced by ``run_deduplication_pass`` (in
     the dataset's ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG/``
-    subfolder), rewrites every ``IN`` clause as ``NOT IN``, and writes
-    the negative JSON + PNG into a fresh subfolder named
-    ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG/``.
+    subfolder), rewrites every categorical clause into a single operator
+    (``NOT IN`` / ``IN``), and writes the JSON + PNG into a fresh
+    subfolder named ``label``.
 
     Returns the list of files written into the new subfolder, or an
     empty list if the deduplicated structure is missing (the
     deduplication pass must have failed earlier in the pipeline).
     """
-    from categorical import cat_NEGATIVE_peer  # local import
+    module = importlib.import_module(f"categorical.{module_name}")
 
     dedup_dir = dataset_out / DEDUPLICATED_LABEL
     src_structure = (
@@ -674,25 +701,25 @@ def run_negative_pass(
     )
     if not src_structure.is_file():
         print(
-            f"  [skip] cat_NEGATIVE_peer on {run_id}: "
+            f"  [skip] {module_name} on {run_id}: "
             f"missing {src_structure.name}"
         )
         return []
 
-    negative_dir = dataset_out / NEGATIVE_LABEL
+    out_dir = dataset_out / label
     # The folder belongs to this pass only: clear it so files left by an
     # earlier run under another name are not uploaded to W&B again.
-    if negative_dir.exists():
-        shutil.rmtree(negative_dir)
-    negative_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     # Short file name on purpose: W&B rejects artifact names over 128
     # characters, and the artifact name is ``<folder>__<file stem>``. The
-    # long ``..._split_grouped_conjunction_deduplicated_negative`` stem
+    # long ``..._split_grouped_conjunction_deduplicated_<tag>`` stem
     # pushed every dataset name longer than 13 characters over the limit.
-    # The PNG takes its name from this JSON (``<run_id>_DPG_negative.png``).
-    dst_structure = negative_dir / f"{run_id}_DPG_negative_structure.json"
+    # The PNG takes its name from this JSON (``<run_id>_DPG_<tag>.png``).
+    dst_structure = out_dir / f"{run_id}_DPG_{tag}_structure.json"
 
-    target, n_rewritten, problems, png_target = cat_NEGATIVE_peer._process_file(
+    target, n_rewritten, problems, png_target = module._process_file(
         str(src_structure),
         out_path=str(dst_structure),
         inplace=False,
@@ -700,13 +727,13 @@ def run_negative_pass(
         visualization_config=visualization_config,
     )
     print(
-        f"  [ok]   cat_NEGATIVE_peer -> {negative_dir} "
+        f"  [ok]   {module_name} -> {out_dir} "
         f"({n_rewritten} label(s) rewritten"
         f", PNG -> {pathlib.Path(png_target).name if png_target else 'n/a'})"
     )
     for problem in problems:
-        print(f"  [warn] cat_NEGATIVE_peer: {problem}")
-    return [p for p in negative_dir.iterdir() if p.is_file()]
+        print(f"  [warn] {module_name}: {problem}")
+    return [p for p in out_dir.iterdir() if p.is_file()]
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +855,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication + negative)")
+    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication + negative + positive)")
     print("=" * 64)
     print(f"Start time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Datasets to run:  {len(pairs)}  ({', '.join(name for name, _ in pairs)})")
