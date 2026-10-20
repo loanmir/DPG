@@ -19,8 +19,9 @@ script:
 4. Runs ``cat_NEGATIVE_peer.py`` and ``cat_POSITIVE_peer.py`` on the
    deduplicated output to rewrite every categorical clause as the
    equivalent ``NOT IN`` (resp. ``IN``) over the attribute's remaining
-   categories, and renders both graphs.
-5. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in seven fixed
+   categories, and renders both graphs. Then runs ``cat_MINIMAL_peer.py``
+   on the two, keeping per clause the form that lists fewer values.
+5. Writes everything under ``DPG/outputs/categorical/<dataset>/`` in eight fixed
    subfolders:
 
      * ``BASIC DPG``                                -- the raw DPGExplainer output
@@ -30,6 +31,7 @@ script:
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG`` -- cat_duplicate_split_peer.py output (deduplicated JSON + PNG)
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG`` -- cat_NEGATIVE_peer.py output (NOT IN-only JSON + PNG)
      * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE DPG`` -- cat_POSITIVE_peer.py output (IN-only JSON + PNG)
+     * ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-MINIMAL DPG``  -- cat_MINIMAL_peer.py output (fewest-values JSON + PNG)
 
 Every dataset's target column is assumed to be its last CSV column (titanic's
 ``titanic.csv`` was reordered on disk so ``Survived`` is last, matching every
@@ -130,6 +132,7 @@ CONJUNCTION_LABEL = "GROUPED-SPLIT-CONJUNCTION DPG"
 DEDUPLICATED_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED DPG"
 NEGATIVE_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-NEGATIVE DPG"
 POSITIVE_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-POSITIVE DPG"
+MINIMAL_LABEL = "GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-MINIMAL DPG"
 
 # The three grouping scripts to run against each basic DPG structure,
 # keyed by their importable module name (relative to the ``categorical``
@@ -575,6 +578,14 @@ def run_one_dataset(
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"  [err]  {module_name} on {dataset_name}: {exc}")
 
+    # --- Minimal pass: combine the NEGATIVE and POSITIVE outputs, keeping
+    # per clause the form that lists fewer values. Its JSON + PNG land in
+    # their own subfolder and are picked up by the rglob below.
+    try:
+        run_minimal_pass(run_id, dataset_out, visualization_config)
+    except Exception as exc:  # noqa: BLE001 - report and continue
+        print(f"  [err]  cat_MINIMAL_peer on {dataset_name}: {exc}")
+
     # --- Move the staging folder into its final "BASIC DPG" name ---------
     basic_dir = dataset_out / BASIC_LABEL
     if basic_dir.exists():
@@ -737,6 +748,64 @@ def run_single_operator_pass(
 
 
 # ---------------------------------------------------------------------------
+# Minimal pass
+# ---------------------------------------------------------------------------
+
+
+def run_minimal_pass(
+    run_id: str,
+    dataset_out: pathlib.Path,
+    visualization_config: dict,
+) -> List[pathlib.Path]:
+    """Run ``cat_MINIMAL_peer`` on the NEGATIVE and POSITIVE structures.
+
+    Reads the two structure JSONs written by ``run_single_operator_pass``
+    (in the ``...-NEGATIVE DPG/`` and ``...-POSITIVE DPG/`` subfolders),
+    keeps per clause the form that lists fewer values (``IN`` on a tie),
+    and writes the minimal JSON + PNG into a fresh subfolder named
+    ``GROUPED-SPLIT-CONJUNCTION-DEDUPLICATED-MINIMAL DPG/``.
+
+    Returns the list of files written into the new subfolder, or an
+    empty list if either input is missing (one of the two passes must
+    have failed earlier in the pipeline).
+    """
+    from categorical import cat_MINIMAL_peer  # local import
+
+    negative = dataset_out / NEGATIVE_LABEL / f"{run_id}_DPG_negative_structure.json"
+    positive = dataset_out / POSITIVE_LABEL / f"{run_id}_DPG_positive_structure.json"
+    for src in (negative, positive):
+        if not src.is_file():
+            print(f"  [skip] cat_MINIMAL_peer on {run_id}: missing {src.name}")
+            return []
+
+    out_dir = dataset_out / MINIMAL_LABEL
+    # The folder belongs to this pass only: clear it so files left by an
+    # earlier run under another name are not uploaded to W&B again.
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Short file name, like the NEGATIVE / POSITIVE passes, to keep the W&B
+    # artifact name (``<folder>__<file stem>``) under 128 characters.
+    dst_structure = out_dir / f"{run_id}_DPG_minimal_structure.json"
+
+    target, stats, png_target = cat_MINIMAL_peer._process_pair(
+        str(negative),
+        str(positive),
+        out_path=str(dst_structure),
+        render=True,
+        visualization_config=visualization_config,
+    )
+    print(
+        f"  [ok]   cat_MINIMAL_peer -> {out_dir} "
+        f"(clauses: {stats['from_negative']} NOT IN, {stats['from_positive']} IN, "
+        f"{stats['identical']} identical; values {stats['values_negative']} NEG / "
+        f"{stats['values_positive']} POS -> {stats['values_minimal']}"
+        f", PNG -> {pathlib.Path(png_target).name if png_target else 'n/a'})"
+    )
+    return [p for p in out_dir.iterdir() if p.is_file()]
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -855,7 +924,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 64)
-    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication + negative + positive)")
+    print("CATEGORICAL DPG BATCH RUNNER (basic run + 3 grouping passes + deduplication + negative + positive + minimal)")
     print("=" * 64)
     print(f"Start time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Datasets to run:  {len(pairs)}  ({', '.join(name for name, _ in pairs)})")
